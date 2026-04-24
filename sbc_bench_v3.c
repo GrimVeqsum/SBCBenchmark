@@ -1,6 +1,3 @@
-
-## `sbc_bench_v4.c`
-```c
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
 #include <errno.h>
@@ -28,11 +25,14 @@
 #define MAX_STEPS 16
 #define MAX_CPUS 256
 
-    typedef enum { WK_IDLE,
-                   WK_CPU_BURN,
-                   WK_STORAGE,
-                   WK_PING,
-                   WK_NN } WorkKind;
+typedef enum
+{
+  WK_IDLE,
+  WK_CPU_BURN,
+  WK_STORAGE,
+  WK_PING,
+  WK_NN
+} WorkKind;
 
 typedef struct
 {
