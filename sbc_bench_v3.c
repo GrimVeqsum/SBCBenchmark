@@ -91,6 +91,25 @@ typedef struct
 
 static volatile sig_atomic_t g_stop = 0;
 
+static const char *kind_name(WorkKind k)
+{
+  switch (k)
+  {
+  case WK_IDLE:
+    return "idle";
+  case WK_CPU_BURN:
+    return "cpu_burn";
+  case WK_STORAGE:
+    return "storage";
+  case WK_PING:
+    return "ping";
+  case WK_NN:
+    return "nn_inference";
+  default:
+    return "unknown";
+  }
+}
+
 static void on_sig(int sig)
 {
   (void)sig;
@@ -764,8 +783,8 @@ static void write_summary(const Scenario *sc, const Collector *c, const StepResu
   fprintf(f, "  \"steps\": [\n");
   for (int i = 0; i < nres; ++i)
   {
-    fprintf(f, "    {\"name\":\"%s\",\"kind\":%d,\"ops_per_sec\":%.3f,\"nn_inf_per_sec\":%.3f,\"throughput_mb_s\":%.3f,\"ping_p99_ms\":%.3f,\"packet_loss_pct\":%.3f}%s\n",
-            res[i].step->name, (int)res[i].step->kind, res[i].ops_per_sec,
+    fprintf(f, "    {\"name\":\"%s\",\"kind\":%d,\"kind_name\":\"%s\",\"ops_per_sec\":%.3f,\"nn_inf_per_sec\":%.3f,\"throughput_mb_s\":%.3f,\"ping_p99_ms\":%.3f,\"packet_loss_pct\":%.3f}%s\n",
+            res[i].step->name, (int)res[i].step->kind, kind_name(res[i].step->kind), res[i].ops_per_sec,
             res[i].nn_inf_per_sec, res[i].throughput_mb_s, res[i].ping_p99_ms, res[i].packet_loss_pct,
             (i + 1 < nres) ? "," : "");
   }
@@ -783,11 +802,31 @@ static void write_report_md(const Scenario *sc, const Collector *c, const StepRe
   fprintf(f, "# SBC Benchmark Report (C)\n\n");
   fprintf(f, "- Scenario: **%s**\n", sc->name);
   fprintf(f, "- Samples: **%zu**\n\n", c->nrows);
-  fprintf(f, "## Steps\n");
+  double temp_max = -1.0, power_sum = 0.0;
+  int power_n = 0;
+  for (size_t i = 0; i < c->nrows; ++i)
+  {
+    if (c->rows[i].temp_c > temp_max)
+      temp_max = c->rows[i].temp_c;
+    if (c->rows[i].power_w > 0.0)
+    {
+      power_sum += c->rows[i].power_w;
+      power_n++;
+    }
+  }
+  fprintf(f, "## Aggregates\n\n");
+  fprintf(f, "- Max temperature: %.3f C\n", temp_max);
+  if (power_n > 0)
+    fprintf(f, "- Avg power: %.3f W\n", power_sum / power_n);
+  else
+    fprintf(f, "- Avg power: N/A\n");
+  fprintf(f, "\n## Steps\n\n");
+  fprintf(f, "| Step | Kind | CPU ops/s | NN inf/s | Storage MB/s | Ping p99 ms | Loss %% |\n");
+  fprintf(f, "|---|---|---:|---:|---:|---:|---:|\n");
   for (int i = 0; i < nres; ++i)
   {
-    fprintf(f, "- `%s`: kind=%d, ops/s=%.3f, nn/s=%.3f, storage(MB/s)=%.3f, ping_p99(ms)=%.3f, loss(%%)=%.3f\n",
-            res[i].step->name, (int)res[i].step->kind, res[i].ops_per_sec, res[i].nn_inf_per_sec,
+    fprintf(f, "| %s | %s | %.3f | %.3f | %.3f | %.3f | %.3f |\n",
+            res[i].step->name, kind_name(res[i].step->kind), res[i].ops_per_sec, res[i].nn_inf_per_sec,
             res[i].throughput_mb_s, res[i].ping_p99_ms, res[i].packet_loss_pct);
   }
   fclose(f);
