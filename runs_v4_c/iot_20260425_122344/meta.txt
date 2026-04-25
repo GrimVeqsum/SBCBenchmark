@@ -1,0 +1,3 @@
+scenario=iot
+sample_sec=1
+critical_temp_c=80.0

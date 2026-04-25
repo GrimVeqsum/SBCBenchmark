@@ -16,6 +16,12 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#include <direct.h>
+#include <malloc.h>
+#endif
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -46,11 +52,14 @@ typedef struct
 typedef struct
 {
   const char *name;
+  const char *description;
   int sample_sec;
   double critical_temp_c;
   double target_ping_p99_ms;
   double ref_perf_per_watt;
   double assumed_power_w;
+  const char *primary_metrics[8];
+  int primary_metric_count;
   Step steps[MAX_STEPS];
   int step_count;
 } Scenario;
@@ -90,6 +99,63 @@ typedef struct
 } Collector;
 
 static volatile sig_atomic_t g_stop = 0;
+
+#ifdef _WIN32
+static int posix_memalign_portable(void **memptr, size_t alignment, size_t size)
+{
+  void *p = _aligned_malloc(size, alignment);
+  if (!p)
+    return ENOMEM;
+  *memptr = p;
+  return 0;
+}
+static void free_aligned_portable(void *p)
+{
+  _aligned_free(p);
+}
+static int fdatasync_portable(int fd)
+{
+  return _commit(fd);
+}
+static int mkdir_portable(const char *path, mode_t mode)
+{
+  (void)mode;
+  return _mkdir(path);
+}
+static void sleep_100ms(void)
+{
+  Sleep(100);
+}
+static void localtime_r_portable(const time_t *tt, struct tm *out)
+{
+  localtime_s(out, tt);
+}
+#else
+static int posix_memalign_portable(void **memptr, size_t alignment, size_t size)
+{
+  return posix_memalign(memptr, alignment, size);
+}
+static void free_aligned_portable(void *p)
+{
+  free(p);
+}
+static int fdatasync_portable(int fd)
+{
+  return fdatasync(fd);
+}
+static int mkdir_portable(const char *path, mode_t mode)
+{
+  return mkdir(path, mode);
+}
+static void sleep_100ms(void)
+{
+  usleep(100000);
+}
+static void localtime_r_portable(const time_t *tt, struct tm *out)
+{
+  localtime_r(tt, out);
+}
+#endif
 
 static const char *kind_name(WorkKind k)
 {
@@ -352,7 +418,7 @@ static void *collector_thread(void *arg)
     pthread_mutex_unlock(&c->lock);
 
     for (int i = 0; i < c->sample_sec * 10 && !c->stop && !g_stop; ++i)
-      usleep(100000);
+      sleep_100ms();
   }
   return NULL;
 }
@@ -419,7 +485,7 @@ static double run_cpu_burn(const Step *s)
     pthread_create(&th[i], NULL, burn_worker, &args[i]);
   }
   for (int i = 0; i < s->duration_sec * 10 && !g_stop; ++i)
-    usleep(100000);
+    sleep_100ms();
   stop = 1;
   for (int i = 0; i < n; ++i)
     pthread_join(th[i], NULL);
@@ -508,7 +574,7 @@ static double run_nn_inference(const Step *s)
     pthread_create(&th[i], NULL, nn_worker, &args[i]);
   }
   for (int i = 0; i < s->duration_sec * 10 && !g_stop; ++i)
-    usleep(100000);
+    sleep_100ms();
   stop = 1;
   for (int i = 0; i < threads; ++i)
     pthread_join(th[i], NULL);
@@ -534,7 +600,7 @@ static double run_storage(const Step *s, const char *out_dir)
   if (s->arg && strcmp(s->arg, "8M") == 0)
     block = 8 * 1024 * 1024;
   char *buf = NULL;
-  if (posix_memalign((void **)&buf, 4096, block) != 0 || !buf)
+  if (posix_memalign_portable((void **)&buf, 4096, block) != 0 || !buf)
   {
     close(fd);
     return -1.0;
@@ -553,10 +619,10 @@ static double run_storage(const Step *s, const char *out_dir)
       break;
     }
     written += (uint64_t)wr;
-    fdatasync(fd);
+    fdatasync_portable(fd);
   }
   double elapsed = now_sec() - t0;
-  free(buf);
+  free_aligned_portable(buf);
   close(fd);
   unlink(path);
   if (elapsed <= 0.0)
@@ -604,6 +670,45 @@ static void run_ping(const Step *s, double *loss_pct, double *p99)
   pclose(p);
 }
 
+static void set_primary_metrics(Scenario *s, const char **metrics, int n)
+{
+  s->primary_metric_count = 0;
+  for (int i = 0; i < n && i < (int)(sizeof(s->primary_metrics) / sizeof(s->primary_metrics[0])); ++i)
+    s->primary_metrics[s->primary_metric_count++] = metrics[i];
+}
+
+static void print_scenario_help(const char *prog)
+{
+  fprintf(stderr, "Usage: %s [scenario] [duration_scale]\n", prog);
+  fprintf(stderr, "       %s --list-scenarios\n", prog);
+  fprintf(stderr, "Scenarios: baseline, iot, server_gateway, embedded, neural_host\n");
+}
+
+static void print_scenario_catalog(void)
+{
+  const char *baseline_metrics[] = {"cpu_ops_avg", "storage_mb_s_avg", "ping_p99_ms_avg", "thermal_headroom_pct"};
+  const char *iot_metrics[] = {"cpu_util_pct_avg", "packet_loss_pct_avg", "ping_p99_ms_avg", "power_w_avg", "mem_used_pct_avg"};
+  const char *server_metrics[] = {"cpu_ops_avg", "storage_mb_s_avg", "ping_p99_ms_avg", "psi_io_some_avg10_max", "temp_c_max"};
+  const char *embedded_metrics[] = {"cpu_ops_avg", "temp_c_max", "power_w_avg", "psi_cpu_some_avg10_max", "mem_used_pct_avg"};
+  const char *neural_metrics[] = {"nn_inf_per_sec_avg", "perf_per_watt", "temp_c_max", "cpu_freq_mhz_avg", "mem_used_pct_avg"};
+
+  fprintf(stdout, "Available scenarios:\n\n");
+  fprintf(stdout, "1) baseline — Универсальный базовый прогон для сравнения плат.\n");
+  fprintf(stdout, "   Метрики: %s, %s, %s, %s\n\n", baseline_metrics[0], baseline_metrics[1], baseline_metrics[2], baseline_metrics[3]);
+
+  fprintf(stdout, "2) iot — Контроллер/сборщик IoT с акцентом на энергоэффективность и сетевую стабильность.\n");
+  fprintf(stdout, "   Метрики: %s, %s, %s, %s, %s\n\n", iot_metrics[0], iot_metrics[1], iot_metrics[2], iot_metrics[3], iot_metrics[4]);
+
+  fprintf(stdout, "3) server_gateway — Сервер/шлюз с длительной CPU, сетью и записью в хранилище.\n");
+  fprintf(stdout, "   Метрики: %s, %s, %s, %s, %s\n\n", server_metrics[0], server_metrics[1], server_metrics[2], server_metrics[3], server_metrics[4]);
+
+  fprintf(stdout, "4) embedded — Встраиваемое устройство с устойчивым контролем и тепловыми ограничениями.\n");
+  fprintf(stdout, "   Метрики: %s, %s, %s, %s, %s\n\n", embedded_metrics[0], embedded_metrics[1], embedded_metrics[2], embedded_metrics[3], embedded_metrics[4]);
+
+  fprintf(stdout, "5) neural_host — Одноплатник с локальным размещением нейросети.\n");
+  fprintf(stdout, "   Метрики: %s, %s, %s, %s, %s\n", neural_metrics[0], neural_metrics[1], neural_metrics[2], neural_metrics[3], neural_metrics[4]);
+}
+
 static Scenario scenario_from_name(const char *name)
 {
   Scenario s;
@@ -614,9 +719,11 @@ static Scenario scenario_from_name(const char *name)
   s.ref_perf_per_watt = 10000000.0;
   s.assumed_power_w = 5.0;
 
-  if (strcmp(name, "server_edge") == 0)
+  if (strcmp(name, "server_gateway") == 0 || strcmp(name, "server_edge") == 0)
   {
-    s.name = "server_edge";
+    const char *metrics[] = {"cpu_ops_avg", "storage_mb_s_avg", "ping_p99_ms_avg", "psi_io_some_avg10_max", "temp_c_max"};
+    s.name = "server_gateway";
+    s.description = "Сервер/шлюз: длительная смешанная нагрузка CPU + storage + network";
     s.critical_temp_c = 90.0;
     s.target_ping_p99_ms = 40.0;
     s.steps[0] = (Step){"warmup", WK_CPU_BURN, 180, 4, NULL};
@@ -624,10 +731,13 @@ static Scenario scenario_from_name(const char *name)
     s.steps[2] = (Step){"storage_write", WK_STORAGE, 180, 0, "8M"};
     s.steps[3] = (Step){"cpu_steady", WK_CPU_BURN, 900, 4, NULL};
     s.step_count = 4;
+    set_primary_metrics(&s, metrics, 5);
   }
   else if (strcmp(name, "embedded") == 0)
   {
+    const char *metrics[] = {"cpu_ops_avg", "temp_c_max", "power_w_avg", "psi_cpu_some_avg10_max", "mem_used_pct_avg"};
     s.name = "embedded";
+    s.description = "Встраиваемое устройство: стабильный контрольный цикл с ограниченным теплопакетом";
     s.critical_temp_c = 85.0;
     s.target_ping_p99_ms = 30.0;
     s.steps[0] = (Step){"boot_settle", WK_IDLE, 60, 0, NULL};
@@ -636,10 +746,13 @@ static Scenario scenario_from_name(const char *name)
     s.steps[3] = (Step){"link_health", WK_PING, 60, 0, "1.1.1.1"};
     s.steps[4] = (Step){"steady_control", WK_CPU_BURN, 240, 2, NULL};
     s.step_count = 5;
+    set_primary_metrics(&s, metrics, 5);
   }
-  else if (strcmp(name, "neural") == 0)
+  else if (strcmp(name, "neural_host") == 0 || strcmp(name, "neural") == 0)
   {
-    s.name = "neural";
+    const char *metrics[] = {"nn_inf_per_sec_avg", "perf_per_watt", "temp_c_max", "cpu_freq_mhz_avg", "mem_used_pct_avg"};
+    s.name = "neural_host";
+    s.description = "Хост нейросети: инференс под длительной нагрузкой и контроль энергоэффективности";
     s.critical_temp_c = 90.0;
     s.target_ping_p99_ms = 35.0;
     s.ref_perf_per_watt = 15000000.0;
@@ -649,10 +762,13 @@ static Scenario scenario_from_name(const char *name)
     s.steps[3] = (Step){"network_probe", WK_PING, 45, 0, "1.1.1.1"};
     s.steps[4] = (Step){"nn_steady", WK_NN, 300, 2, "48"};
     s.step_count = 5;
+    set_primary_metrics(&s, metrics, 5);
   }
-  else if (strcmp(name, "iot_controller") == 0)
+  else if (strcmp(name, "iot") == 0 || strcmp(name, "iot_controller") == 0)
   {
-    s.name = "iot_controller";
+    const char *metrics[] = {"cpu_util_pct_avg", "packet_loss_pct_avg", "ping_p99_ms_avg", "power_w_avg", "mem_used_pct_avg"};
+    s.name = "iot";
+    s.description = "IoT сценарий: опрос сенсоров, выгрузка телеметрии и окно сна";
     s.critical_temp_c = 80.0;
     s.target_ping_p99_ms = 20.0;
     s.ref_perf_per_watt = 7000000.0;
@@ -663,16 +779,20 @@ static Scenario scenario_from_name(const char *name)
     s.steps[3] = (Step){"uplink_health", WK_PING, 60, 0, "1.1.1.1"};
     s.steps[4] = (Step){"sleep_window", WK_IDLE, 180, 0, NULL};
     s.step_count = 5;
+    set_primary_metrics(&s, metrics, 5);
   }
   else
   {
+    const char *metrics[] = {"cpu_ops_avg", "storage_mb_s_avg", "ping_p99_ms_avg", "thermal_headroom_pct"};
     s.name = "baseline";
+    s.description = "Базовый сценарий: CPU + storage + network для первичного сравнения плат";
     s.steps[0] = (Step){"boot_settle", WK_IDLE, 30, 0, NULL};
     s.steps[1] = (Step){"cpu_warmup", WK_CPU_BURN, 120, 2, NULL};
     s.steps[2] = (Step){"storage_probe", WK_STORAGE, 90, 0, "4M"};
     s.steps[3] = (Step){"network_probe", WK_PING, 45, 0, "1.1.1.1"};
     s.steps[4] = (Step){"cpu_steady", WK_CPU_BURN, 300, 2, NULL};
     s.step_count = 5;
+    set_primary_metrics(&s, metrics, 4);
   }
   return s;
 }
@@ -687,12 +807,12 @@ static int mkdir_p(const char *path)
     if (*p == '/')
     {
       *p = '\0';
-      if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
+      if (mkdir_portable(tmp, 0755) != 0 && errno != EEXIST)
         return -1;
       *p = '/';
     }
   }
-  if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
+  if (mkdir_portable(tmp, 0755) != 0 && errno != EEXIST)
     return -1;
   return 0;
 }
@@ -707,8 +827,9 @@ static void write_summary(const Scenario *sc, const Collector *c, const StepResu
     return;
 
   double temp_max = -1, temp_start = -1, temp_end = -1;
-  double freq_sum = 0, util_sum = 0, power_sum = 0;
-  int freq_n = 0, util_n = 0, power_n = 0;
+  double freq_sum = 0, util_sum = 0, power_sum = 0, mem_sum = 0;
+  double psi_cpu_max = -1.0, psi_io_max = -1.0, psi_mem_max = -1.0;
+  int freq_n = 0, util_n = 0, power_n = 0, mem_n = 0;
   if (c->nrows > 0)
   {
     temp_start = c->rows[0].temp_c;
@@ -729,25 +850,58 @@ static void write_summary(const Scenario *sc, const Collector *c, const StepResu
       util_sum += r->cpu_util_pct;
       util_n++;
     }
+    if (r->mem_used_pct >= 0)
+    {
+      mem_sum += r->mem_used_pct;
+      mem_n++;
+    }
     if (r->power_w > 0)
     {
       power_sum += r->power_w;
       power_n++;
     }
+    if (r->psi_cpu_some_avg10 > psi_cpu_max)
+      psi_cpu_max = r->psi_cpu_some_avg10;
+    if (r->psi_io_some_avg10 > psi_io_max)
+      psi_io_max = r->psi_io_some_avg10;
+    if (r->psi_mem_some_avg10 > psi_mem_max)
+      psi_mem_max = r->psi_mem_some_avg10;
   }
 
   double cpu_ops[16];
   int cpu_n = 0;
   double ping_p99[16];
   int ping_n = 0;
+  double storage_sum = 0.0, nn_sum = 0.0, cpu_sum = 0.0, loss_sum = 0.0;
+  int storage_n = 0, nn_n = 0, cpu_step_n = 0, loss_n = 0;
   for (int i = 0; i < nres; ++i)
   {
-    if (res[i].step->kind == WK_CPU_BURN && res[i].ops_per_sec > 0 && cpu_n < 16)
-      cpu_ops[cpu_n++] = res[i].ops_per_sec;
-    if (res[i].step->kind == WK_NN && res[i].nn_inf_per_sec > 0 && cpu_n < 16)
-      cpu_ops[cpu_n++] = res[i].nn_inf_per_sec;
+    if (res[i].step->kind == WK_CPU_BURN && res[i].ops_per_sec > 0)
+    {
+      if (cpu_n < 16)
+        cpu_ops[cpu_n++] = res[i].ops_per_sec;
+      cpu_sum += res[i].ops_per_sec;
+      cpu_step_n++;
+    }
+    if (res[i].step->kind == WK_NN && res[i].nn_inf_per_sec > 0)
+    {
+      if (cpu_n < 16)
+        cpu_ops[cpu_n++] = res[i].nn_inf_per_sec;
+      nn_sum += res[i].nn_inf_per_sec;
+      nn_n++;
+    }
     if (res[i].step->kind == WK_PING && res[i].ping_p99_ms > 0 && ping_n < 16)
       ping_p99[ping_n++] = res[i].ping_p99_ms;
+    if (res[i].step->kind == WK_PING && res[i].packet_loss_pct >= 0.0)
+    {
+      loss_sum += res[i].packet_loss_pct;
+      loss_n++;
+    }
+    if (res[i].step->kind == WK_STORAGE && res[i].throughput_mb_s > 0)
+    {
+      storage_sum += res[i].throughput_mb_s;
+      storage_n++;
+    }
   }
 
   double perf_w = 0.0;
@@ -787,17 +941,52 @@ static void write_summary(const Scenario *sc, const Collector *c, const StepResu
   }
   double perf_n = fmax(0.0, fmin(1.0, perf_w / sc->ref_perf_per_watt));
   double score = 100.0 * (0.35 * perf_n + 0.25 * thermal + 0.25 * stability + 0.15 * tail);
+  double cpu_avg = cpu_step_n ? cpu_sum / cpu_step_n : -1.0;
+  double nn_avg = nn_n ? nn_sum / nn_n : -1.0;
+  double storage_avg = storage_n ? storage_sum / storage_n : -1.0;
+  double ping_avg = -1.0;
+  if (ping_n > 0)
+  {
+    double sum = 0.0;
+    for (int i = 0; i < ping_n; ++i)
+      sum += ping_p99[i];
+    ping_avg = sum / ping_n;
+  }
+  double loss_avg = loss_n ? loss_sum / loss_n : -1.0;
 
   fprintf(f, "{\n");
   fprintf(f, "  \"scenario\": \"%s\",\n", sc->name);
+  fprintf(f, "  \"description\": \"%s\",\n", sc->description ? sc->description : "");
+  fprintf(f, "  \"metric_profile\": {\n");
+  fprintf(f, "    \"primary_metrics\": [");
+  for (int i = 0; i < sc->primary_metric_count; ++i)
+    fprintf(f, "\"%s\"%s", sc->primary_metrics[i], (i + 1 < sc->primary_metric_count) ? ", " : "");
+  fprintf(f, "],\n");
+  fprintf(f, "    \"score_components\": {\"perf\": 0.35, \"thermal\": 0.25, \"stability\": 0.25, \"tail_latency\": 0.15}\n");
+  fprintf(f, "  },\n");
   fprintf(f, "  \"aggregates\": {\n");
   fprintf(f, "    \"temp_c_start\": %.3f,\n", temp_start);
   fprintf(f, "    \"temp_c_end\": %.3f,\n", temp_end);
   fprintf(f, "    \"temp_c_max\": %.3f,\n", temp_max);
   fprintf(f, "    \"cpu_freq_mhz_avg\": %.3f,\n", freq_n ? freq_sum / freq_n : -1.0);
   fprintf(f, "    \"cpu_util_pct_avg\": %.3f,\n", util_n ? util_sum / util_n : -1.0);
+  fprintf(f, "    \"mem_used_pct_avg\": %.3f,\n", mem_n ? mem_sum / mem_n : -1.0);
   fprintf(f, "    \"power_w_avg\": %.3f,\n", power_n ? power_sum / power_n : -1.0);
+  fprintf(f, "    \"psi_cpu_some_avg10_max\": %.3f,\n", psi_cpu_max);
+  fprintf(f, "    \"psi_io_some_avg10_max\": %.3f,\n", psi_io_max);
+  fprintf(f, "    \"psi_mem_some_avg10_max\": %.3f,\n", psi_mem_max);
   fprintf(f, "    \"perf_per_watt\": %.3f\n", perf_w);
+  fprintf(f, "  },\n");
+  fprintf(f, "  \"scenario_metrics\": {\n");
+  fprintf(f, "    \"cpu_ops_avg\": %.3f,\n", cpu_avg);
+  fprintf(f, "    \"nn_inf_per_sec_avg\": %.3f,\n", nn_avg);
+  fprintf(f, "    \"storage_mb_s_avg\": %.3f,\n", storage_avg);
+  fprintf(f, "    \"ping_p99_ms_avg\": %.3f,\n", ping_avg);
+  fprintf(f, "    \"packet_loss_pct_avg\": %.3f,\n", loss_avg);
+  fprintf(f, "    \"thermal_headroom_pct\": %.3f,\n", thermal * 100.0);
+  fprintf(f, "    \"stability_score_pct\": %.3f,\n", stability * 100.0);
+  fprintf(f, "    \"network_tail_score_pct\": %.3f,\n", tail * 100.0);
+  fprintf(f, "    \"energy_efficiency_score_pct\": %.3f\n", perf_n * 100.0);
   fprintf(f, "  },\n");
   fprintf(f, "  \"score\": %.2f,\n", score);
   fprintf(f, "  \"steps\": [\n");
@@ -858,7 +1047,32 @@ int main(int argc, char **argv)
   signal(SIGINT, on_sig);
   signal(SIGTERM, on_sig);
 
+  if (argc >= 2 && (strcmp(argv[1], "--list-scenarios") == 0 || strcmp(argv[1], "-l") == 0))
+  {
+    print_scenario_catalog();
+    return 0;
+  }
+  if (argc >= 2 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0))
+  {
+    print_scenario_help(argv[0]);
+    return 0;
+  }
+
   const char *scenario_name = (argc >= 2) ? argv[1] : "baseline";
+  if (!(strcmp(scenario_name, "baseline") == 0 ||
+        strcmp(scenario_name, "iot") == 0 ||
+        strcmp(scenario_name, "iot_controller") == 0 ||
+        strcmp(scenario_name, "server_gateway") == 0 ||
+        strcmp(scenario_name, "server_edge") == 0 ||
+        strcmp(scenario_name, "embedded") == 0 ||
+        strcmp(scenario_name, "neural_host") == 0 ||
+        strcmp(scenario_name, "neural") == 0))
+  {
+    fprintf(stderr, "Unknown scenario: %s\n\n", scenario_name);
+    print_scenario_help(argv[0]);
+    return 2;
+  }
+
   double duration_scale = 1.0;
   if (argc >= 3)
   {
@@ -880,7 +1094,7 @@ int main(int argc, char **argv)
 
   time_t tt = time(NULL);
   struct tm tm;
-  localtime_r(&tt, &tm);
+  localtime_r_portable(&tt, &tm);
   char run_dir[PATH_MAX];
   snprintf(run_dir, sizeof(run_dir), "runs_v4_c/%s_%04d%02d%02d_%02d%02d%02d",
            sc.name, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
@@ -919,7 +1133,7 @@ int main(int argc, char **argv)
     if (st->kind == WK_IDLE)
     {
       for (int k = 0; k < st->duration_sec * 10 && !g_stop; ++k)
-        usleep(100000);
+        sleep_100ms();
     }
     else if (st->kind == WK_CPU_BURN)
     {

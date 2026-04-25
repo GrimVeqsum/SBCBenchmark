@@ -1,0 +1,40 @@
+{
+  "scenario": "baseline",
+  "description": "Базовый сценарий: CPU + storage + network для первичного сравнения плат",
+  "metric_profile": {
+    "primary_metrics": ["cpu_ops_avg", "storage_mb_s_avg", "ping_p99_ms_avg", "thermal_headroom_pct"],
+    "score_components": {"perf": 0.35, "thermal": 0.25, "stability": 0.25, "tail_latency": 0.15}
+  },
+  "aggregates": {
+    "temp_c_start": -1.000,
+    "temp_c_end": -1.000,
+    "temp_c_max": -1.000,
+    "cpu_freq_mhz_avg": -1.000,
+    "cpu_util_pct_avg": -1.000,
+    "mem_used_pct_avg": -1.000,
+    "power_w_avg": -1.000,
+    "psi_cpu_some_avg10_max": -1.000,
+    "psi_io_some_avg10_max": -1.000,
+    "psi_mem_some_avg10_max": -1.000,
+    "perf_per_watt": 22870315610175.586
+  },
+  "scenario_metrics": {
+    "cpu_ops_avg": 114351578050877.938,
+    "nn_inf_per_sec_avg": -1.000,
+    "storage_mb_s_avg": 317.626,
+    "ping_p99_ms_avg": -1.000,
+    "packet_loss_pct_avg": -1.000,
+    "thermal_headroom_pct": 0.000,
+    "stability_score_pct": 99.404,
+    "network_tail_score_pct": 50.000,
+    "energy_efficiency_score_pct": 100.000
+  },
+  "score": 67.35,
+  "steps": [
+    {"name":"boot_settle","kind":0,"kind_name":"idle","ops_per_sec":0.000,"nn_inf_per_sec":0.000,"throughput_mb_s":0.000,"ping_p99_ms":0.000,"packet_loss_pct":0.000},
+    {"name":"cpu_warmup","kind":1,"kind_name":"cpu_burn","ops_per_sec":114693558493962.250,"nn_inf_per_sec":0.000,"throughput_mb_s":0.000,"ping_p99_ms":0.000,"packet_loss_pct":0.000},
+    {"name":"storage_probe","kind":2,"kind_name":"storage","ops_per_sec":0.000,"nn_inf_per_sec":0.000,"throughput_mb_s":317.626,"ping_p99_ms":0.000,"packet_loss_pct":0.000},
+    {"name":"network_probe","kind":3,"kind_name":"ping","ops_per_sec":0.000,"nn_inf_per_sec":0.000,"throughput_mb_s":0.000,"ping_p99_ms":-1.000,"packet_loss_pct":-1.000},
+    {"name":"cpu_steady","kind":1,"kind_name":"cpu_burn","ops_per_sec":114009597607793.641,"nn_inf_per_sec":0.000,"throughput_mb_s":0.000,"ping_p99_ms":0.000,"packet_loss_pct":0.000}
+  ]
+}
