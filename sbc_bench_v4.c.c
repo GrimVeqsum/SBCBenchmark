@@ -244,6 +244,19 @@ static double read_psi_avg10(const char *kind)
   return atof(pos + 6);
 }
 
+static int join_path(char *dst, size_t dst_sz, const char *dir, const char *name)
+{
+  if (!dst || !dir || !name || dst_sz == 0)
+    return -1;
+  int n = snprintf(dst, dst_sz, "%s/%s", dir, name);
+  if (n < 0 || (size_t)n >= dst_sz)
+  {
+    fprintf(stderr, "path too long: %s/%s\n", dir, name);
+    return -1;
+  }
+  return 0;
+}
+
 static double read_cpu_util_pct(void)
 {
   static uint64_t p_idle = 0, p_total = 0;
@@ -301,7 +314,8 @@ static double read_mem_used_pct(void)
 static void write_csv(const Collector *c)
 {
   char path[PATH_MAX];
-  snprintf(path, sizeof(path), "%s/telemetry.csv", c->out_dir);
+  if (join_path(path, sizeof(path), c->out_dir, "telemetry.csv") != 0)
+    return;
   FILE *f = fopen(path, "w");
   if (!f)
     return;
@@ -508,7 +522,8 @@ static double run_nn_inference(const Step *s)
 static double run_storage(const Step *s, const char *out_dir)
 {
   char path[PATH_MAX];
-  snprintf(path, sizeof(path), "%s/storage_test.bin", out_dir);
+  if (join_path(path, sizeof(path), out_dir, "storage_test.bin") != 0)
+    return -1.0;
   int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
   if (fd < 0)
     return -1.0;
@@ -665,23 +680,28 @@ static Scenario scenario_from_name(const char *name)
 static int mkdir_p(const char *path)
 {
   char tmp[PATH_MAX];
-  snprintf(tmp, sizeof(tmp), "%s", path);
+  if (snprintf(tmp, sizeof(tmp), "%s", path) >= (int)sizeof(tmp))
+    return -1;
   for (char *p = tmp + 1; *p; ++p)
   {
     if (*p == '/')
     {
       *p = '\0';
-      mkdir(tmp, 0755);
+      if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
+        return -1;
       *p = '/';
     }
   }
-  return mkdir(tmp, 0755);
+  if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
+    return -1;
+  return 0;
 }
 
 static void write_summary(const Scenario *sc, const Collector *c, const StepResult *res, int nres)
 {
   char path[PATH_MAX];
-  snprintf(path, sizeof(path), "%s/summary.json", c->out_dir);
+  if (join_path(path, sizeof(path), c->out_dir, "summary.json") != 0)
+    return;
   FILE *f = fopen(path, "w");
   if (!f)
     return;
@@ -795,7 +815,8 @@ static void write_summary(const Scenario *sc, const Collector *c, const StepResu
 static void write_report_md(const Scenario *sc, const Collector *c, const StepResult *res, int nres)
 {
   char path[PATH_MAX];
-  snprintf(path, sizeof(path), "%s/report.md", c->out_dir);
+  if (join_path(path, sizeof(path), c->out_dir, "report.md") != 0)
+    return;
   FILE *f = fopen(path, "w");
   if (!f)
     return;
@@ -863,7 +884,11 @@ int main(int argc, char **argv)
   char run_dir[PATH_MAX];
   snprintf(run_dir, sizeof(run_dir), "runs_v4_c/%s_%04d%02d%02d_%02d%02d%02d",
            sc.name, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
-  mkdir_p(run_dir);
+  if (mkdir_p(run_dir) != 0)
+  {
+    fprintf(stderr, "failed to create run directory: %s\n", run_dir);
+    return 1;
+  }
 
   Collector c;
   memset(&c, 0, sizeof(c));
@@ -922,7 +947,11 @@ int main(int argc, char **argv)
   write_report_md(&sc, &c, results, nres);
 
   char meta_path[PATH_MAX];
-  snprintf(meta_path, sizeof(meta_path), "%s/meta.txt", run_dir);
+  if (join_path(meta_path, sizeof(meta_path), run_dir, "meta.txt") != 0)
+  {
+    free(c.rows);
+    return 1;
+  }
   FILE *mf = fopen(meta_path, "w");
   if (mf)
   {
