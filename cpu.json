@@ -1,0 +1,31 @@
+{
+  "started_at": "2026-01-19T16:17:42Z",
+  "command": "cpu",
+  "type": "cpu-int",
+  "params": {
+    "seconds": 2.000,
+    "threads": 4,
+    "repeats": 3,
+    "size_mb": 128,
+    "steps": 20000000,
+    "file_mb": 256,
+    "block_kb": 64,
+    "fsync": 0,
+    "path": null
+  },
+  "samples": {
+    "metric": "elapsed_seconds",
+    "unit": "s",
+    "values": [2.000542, 2.000091, 2.000113]
+  },
+  "summary": {
+    "min": 2.000091,
+    "median": 2.000113,
+    "max": 2.000542
+  },
+  "derived": {
+    "metric": "ops_per_second",
+    "unit": "ops/s",
+    "value": 1856950546.531757
+  }
+}

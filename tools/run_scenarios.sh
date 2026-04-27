@@ -6,7 +6,7 @@ SCALE="${2:-0.05}"
 
 if [ ! -x "$BIN" ]; then
   echo "Binary '$BIN' not found or not executable" >&2
-  echo "Build example: gcc -std=c11 -O2 -pthread sbc_bench_v4.c -lm -o sbc_bench_v4" >&2
+  echo "Build example: gcc -std=c11 -O2 -pthread sbc_bench_v4.c sbc_bench_scenarios.c -lm -o sbc_bench_v4" >&2
   exit 1
 fi
 

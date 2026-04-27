@@ -1,0 +1,24 @@
+# Build artifacts
+sbc_bench_v4
+sbcbench
+*.exe
+*.out
+*.o
+*.obj
+*.a
+*.so
+*.dll
+
+# Local test binaries
+test.bin
+
+# Runtime outputs
+results/
+runs_v4_c/*
+!runs_v4_c/.gitkeep
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

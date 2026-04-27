@@ -38,7 +38,7 @@ ensure_binary() {
   local bin="$1"
   if [ ! -x "$bin" ]; then
     echo "Бинарник '$bin' не найден. Выполняю сборку..."
-    gcc -std=c11 -O2 -pthread sbc_bench_v4.c -lm -o "$bin"
+    gcc -std=c11 -O2 -pthread sbc_bench_v4.c sbc_bench_scenarios.c -lm -o "$bin"
     echo "Сборка завершена: $bin"
   fi
 }
@@ -138,7 +138,7 @@ MENU
         pause
         ;;
       6)
-        gcc -std=c11 -O2 -pthread sbc_bench_v4.c -lm -o "$bin"
+        gcc -std=c11 -O2 -pthread sbc_bench_v4.c sbc_bench_scenarios.c -lm -o "$bin"
         echo "Сборка завершена: $bin"
         pause
         ;;
