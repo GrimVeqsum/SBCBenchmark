@@ -5,11 +5,13 @@
 #include <string.h>
 
 static const ScenarioEntry g_scenario_entries[] = {
-    {"baseline", "Custom (base profile)", "Базовый профиль: CPU + storage + network; подходит как отправная точка."},
-    {"iot", "IoT controller", "Управление умными устройствами: короткие bursts + окно сна + стабильный uplink."},
-    {"embedded", "Embedded control", "Встраиваемый режим: предсказуемая средняя нагрузка и тепловая устойчивость."},
-    {"neural_host", "Neural inference", "Локальный инференс: длительная нейросетевая нагрузка + контроль энергоэффективности."},
-    {"server_gateway", "Gateway / data server", "Шлюз и сервер хранения: длительный mixed workload CPU + сеть + запись."},
+    {"baseline", "Базовый тест", "CPU + memory + storage + network + jitter"},
+    {"long_soak", "Длительный тест устойчивости", "Прогрев + длинная фаза устойчивости"},
+    {"server_gateway", "Периферийный сервер", "CPU/IO/сеть с акцентом на хранение и RTT"},
+    {"iot", "Контроллер IoT", "Короткие bursts + стабильный uplink + low power"},
+    {"embedded", "Встраиваемый сценарий", "Предсказуемая средняя нагрузка и контроль тепла"},
+    {"neural_host", "Нейросетевой сценарий", "Лёгкая матричная/векторная нагрузка"},
+    {"manual", "Ручной выбор тестов", "Выбор отдельных тестов пользователем"},
 };
 
 static const char *kind_name_local(WorkKind k)
@@ -26,6 +28,10 @@ static const char *kind_name_local(WorkKind k)
     return "ping";
   case WK_NN:
     return "nn_inference";
+  case WK_MEMORY:
+    return "memory";
+  case WK_JITTER:
+    return "jitter";
   default:
     return "unknown";
   }
@@ -56,32 +62,78 @@ void print_scenario_help(const char *prog)
   fprintf(stderr, "Usage: %s [scenario] [duration_scale]\n", prog);
   fprintf(stderr, "       %s --menu\n", prog);
   fprintf(stderr, "       %s --list-scenarios\n", prog);
-  fprintf(stderr, "Scenarios: baseline(custom), iot, server_gateway, embedded, neural_host\n");
+  fprintf(stderr, "Scenarios: baseline, long_soak, server_gateway, iot, embedded, neural_host, manual\n");
 }
 
 void print_scenario_catalog(void)
 {
-  const char *baseline_metrics[] = {"cpu_ops_avg", "storage_mb_s_avg", "ping_p99_ms_avg", "thermal_headroom_pct"};
-  const char *iot_metrics[] = {"cpu_util_pct_avg", "packet_loss_pct_avg", "ping_p99_ms_avg", "power_w_avg", "mem_used_pct_avg"};
-  const char *server_metrics[] = {"cpu_ops_avg", "storage_mb_s_avg", "ping_p99_ms_avg", "psi_io_some_avg10_max", "temp_c_max"};
-  const char *embedded_metrics[] = {"cpu_ops_avg", "temp_c_max", "power_w_avg", "psi_cpu_some_avg10_max", "mem_used_pct_avg"};
-  const char *neural_metrics[] = {"nn_inf_per_sec_avg", "perf_per_watt", "temp_c_max", "cpu_freq_mhz_avg", "mem_used_pct_avg"};
+  fprintf(stdout, "Сценарии:\n");
+  for (size_t i = 0; i < sizeof(g_scenario_entries) / sizeof(g_scenario_entries[0]); ++i)
+  {
+    fprintf(stdout, " %zu) %s (%s)\n    %s\n",
+            i + 1,
+            g_scenario_entries[i].title,
+            g_scenario_entries[i].key,
+            g_scenario_entries[i].description);
+  }
+}
 
-  fprintf(stdout, "Available scenarios:\n\n");
-  fprintf(stdout, "1) baseline — Универсальный базовый прогон для сравнения плат.\n");
-  fprintf(stdout, "   Метрики: %s, %s, %s, %s\n\n", baseline_metrics[0], baseline_metrics[1], baseline_metrics[2], baseline_metrics[3]);
+static Scenario build_manual_scenario_from_prompt(void)
+{
+  Scenario s;
+  memset(&s, 0, sizeof(s));
+  s.name = "manual";
+  s.description = "Ручной выбор отдельных тестов";
+  s.sample_sec = 1;
+  s.critical_temp_c = 85.0;
+  s.target_ping_p99_ms = 25.0;
+  s.ref_perf_per_watt = 10000000.0;
+  s.assumed_power_w = 5.0;
+  s.noise_mode = NOISE_NONE;
 
-  fprintf(stdout, "2) iot — Контроллер/сборщик IoT с акцентом на энергоэффективность и сетевую стабильность.\n");
-  fprintf(stdout, "   Метрики: %s, %s, %s, %s, %s\n\n", iot_metrics[0], iot_metrics[1], iot_metrics[2], iot_metrics[3], iot_metrics[4]);
+  fprintf(stdout, "\nВыбери тесты (через пробел, Enter=все):\n");
+  fprintf(stdout, "1=CPU 2=MEMORY 3=STORAGE 4=NETWORK 5=JITTER 6=NN\n> ");
 
-  fprintf(stdout, "3) server_gateway — Сервер/шлюз с длительной CPU, сетью и записью в хранилище.\n");
-  fprintf(stdout, "   Метрики: %s, %s, %s, %s, %s\n\n", server_metrics[0], server_metrics[1], server_metrics[2], server_metrics[3], server_metrics[4]);
+  char line[256];
+  if (!fgets(line, sizeof(line), stdin))
+    line[0] = '\0';
 
-  fprintf(stdout, "4) embedded — Встраиваемое устройство с устойчивым контролем и тепловыми ограничениями.\n");
-  fprintf(stdout, "   Метрики: %s, %s, %s, %s, %s\n\n", embedded_metrics[0], embedded_metrics[1], embedded_metrics[2], embedded_metrics[3], embedded_metrics[4]);
+  int use_cpu = (strstr(line, "1") != NULL);
+  int use_mem = (strstr(line, "2") != NULL);
+  int use_sto = (strstr(line, "3") != NULL);
+  int use_net = (strstr(line, "4") != NULL);
+  int use_jit = (strstr(line, "5") != NULL);
+  int use_nn = (strstr(line, "6") != NULL);
 
-  fprintf(stdout, "5) neural_host — Одноплатник с локальным размещением нейросети.\n");
-  fprintf(stdout, "   Метрики: %s, %s, %s, %s, %s\n", neural_metrics[0], neural_metrics[1], neural_metrics[2], neural_metrics[3], neural_metrics[4]);
+  if (line[0] == '\n' || line[0] == '\0')
+    use_cpu = use_mem = use_sto = use_net = use_jit = use_nn = 1;
+
+  int n = 0;
+  if (use_cpu)
+    s.steps[n++] = make_step("cpu_manual", WK_CPU_BURN, 90, 2, NULL, "steady", "Ручной CPU тест");
+  if (use_mem)
+    s.steps[n++] = make_step("memory_manual", WK_MEMORY, 45, 1, "64M", "steady", "Ручной memory тест");
+  if (use_sto)
+    s.steps[n++] = make_step("storage_manual", WK_STORAGE, 60, 1, "4M", "steady", "Ручной storage тест");
+  if (use_net)
+    s.steps[n++] = make_step("network_manual", WK_PING, 45, 1, "1.1.1.1", "steady", "Ручной network RTT тест");
+  if (use_jit)
+    s.steps[n++] = make_step("jitter_manual", WK_JITTER, 20, 1, "1000", "steady", "Ручной jitter тест");
+  if (use_nn)
+    s.steps[n++] = make_step("nn_manual", WK_NN, 60, 2, "32", "steady", "Ручной NN тест");
+
+  s.step_count = n;
+
+  const char *metrics[] = {
+      "cpu_ops_avg",
+      "mem_copy_mb_s_avg",
+      "storage_mb_s_avg",
+      "ping_p95_ms_avg",
+      "jitter_p99_us",
+      "nn_inf_per_sec_avg"};
+  set_primary_metrics(&s, metrics, 6);
+
+  return s;
 }
 
 Scenario scenario_from_name(const char *name)
@@ -93,93 +145,102 @@ Scenario scenario_from_name(const char *name)
   s.target_ping_p99_ms = 25.0;
   s.ref_perf_per_watt = 10000000.0;
   s.assumed_power_w = 5.0;
+  s.noise_mode = NOISE_NONE;
 
-  if (strcmp(name, "server_gateway") == 0 || strcmp(name, "server_edge") == 0)
+  if (strcmp(name, "long_soak") == 0 || strcmp(name, "soak") == 0)
   {
-    const char *metrics[] = {"cpu_ops_avg", "storage_mb_s_avg", "ping_p99_ms_avg", "psi_io_some_avg10_max", "temp_c_max"};
-    s.name = "server_gateway";
-    s.description = "Сервер/шлюз: длительная смешанная нагрузка CPU + storage + network";
+    const char *metrics[] = {"cpu_ops_avg", "temp_c_max", "cpu_freq_mhz_avg", "psi_cpu_some_avg10_max", "stability_score_pct"};
+    s.name = "long_soak";
+    s.description = "Длительный тест устойчивости";
     s.critical_temp_c = 90.0;
     s.target_ping_p99_ms = 40.0;
-    s.steps[0] = make_step("warmup", WK_CPU_BURN, 180, 4, NULL, "burst", "Разогрев CPU и вывод частот в рабочий диапазон");
-    s.steps[1] = make_step("network_latency", WK_PING, 120, 0, "8.8.8.8", "steady", "Оценка tail latency канала для ролей шлюза");
-    s.steps[2] = make_step("storage_write", WK_STORAGE, 180, 0, "8M", "burst", "Проверка пропускной способности записи для кэша/логов");
-    s.steps[3] = make_step("cpu_steady", WK_CPU_BURN, 900, 4, NULL, "steady", "Длительная нагрузка для оценки троттлинга и стабильности");
-    s.step_count = 4;
+    s.noise_mode = NOISE_CPU;
+    s.steps[0] = make_step("warmup", WK_CPU_BURN, 180, 2, NULL, "burst", "Прогрев");
+    s.steps[1] = make_step("steady_cpu", WK_CPU_BURN, 1200, 2, NULL, "steady", "Длинная CPU-фаза");
+    s.steps[2] = make_step("steady_memory", WK_MEMORY, 120, 1, "128M", "steady", "Проверка памяти");
+    s.steps[3] = make_step("steady_storage", WK_STORAGE, 240, 1, "4M", "steady", "Storage длительная фаза");
+    s.steps[4] = make_step("steady_network", WK_PING, 180, 1, "1.1.1.1", "steady", "RTT фаза");
+    s.steps[5] = make_step("steady_jitter", WK_JITTER, 30, 1, "1000", "steady", "Jitter фаза");
+    s.step_count = 6;
     set_primary_metrics(&s, metrics, 5);
   }
-  else if (strcmp(name, "embedded") == 0)
+  else if (strcmp(name, "server_gateway") == 0)
   {
-    const char *metrics[] = {"cpu_ops_avg", "temp_c_max", "power_w_avg", "psi_cpu_some_avg10_max", "mem_used_pct_avg"};
-    s.name = "embedded";
-    s.description = "Встраиваемое устройство: стабильный контрольный цикл с ограниченным теплопакетом";
-    s.critical_temp_c = 85.0;
-    s.target_ping_p99_ms = 30.0;
-    s.steps[0] = make_step("boot_settle", WK_IDLE, 60, 0, NULL, "recovery", "Стабилизация после старта, контроль фоновой температуры");
-    s.steps[1] = make_step("control_compute", WK_CPU_BURN, 120, 2, NULL, "steady", "Имитация контрольного цикла встроенного устройства");
-    s.steps[2] = make_step("persistent_storage", WK_STORAGE, 90, 0, "1M", "burst", "Короткие записи состояния/журнала");
-    s.steps[3] = make_step("link_health", WK_PING, 60, 0, "1.1.1.1", "steady", "Проверка сетевой предсказуемости для управляющего контура");
-    s.steps[4] = make_step("steady_control", WK_CPU_BURN, 240, 2, NULL, "steady", "Устойчивость вычислений на средней мощности");
-    s.step_count = 5;
-    set_primary_metrics(&s, metrics, 5);
-  }
-  else if (strcmp(name, "neural_host") == 0 || strcmp(name, "neural") == 0)
-  {
-    const char *metrics[] = {"nn_inf_per_sec_avg", "perf_per_watt", "temp_c_max", "cpu_freq_mhz_avg", "mem_used_pct_avg"};
-    s.name = "neural_host";
-    s.description = "Хост нейросети: инференс под длительной нагрузкой и контроль энергоэффективности";
+    const char *metrics[] = {"storage_mb_s_avg", "storage_lat_p99_us", "ping_p95_ms_avg", "packet_loss_pct_avg", "psi_io_some_avg10_max"};
+    s.name = "server_gateway";
+    s.description = "Сценарий периферийного сервера";
     s.critical_temp_c = 90.0;
-    s.target_ping_p99_ms = 35.0;
-    s.ref_perf_per_watt = 15000000.0;
-    s.steps[0] = make_step("idle_baseline", WK_IDLE, 60, 0, NULL, "recovery", "Базовый тепловой/энергетический фон перед инференсом");
-    s.steps[1] = make_step("nn_warmup", WK_NN, 120, 2, "32", "burst", "Разогрев модели и кэшей памяти");
-    s.steps[2] = make_step("storage_checkpoint", WK_STORAGE, 60, 0, "4M", "burst", "Промежуточная запись артефактов");
-    s.steps[3] = make_step("network_probe", WK_PING, 45, 0, "1.1.1.1", "steady", "Контроль сетевого хвоста во время работы модели");
-    s.steps[4] = make_step("nn_steady", WK_NN, 300, 2, "48", "steady", "Длительный инференс для метрик perf/watt и тепла");
-    s.step_count = 5;
+    s.target_ping_p99_ms = 50.0;
+    s.noise_mode = NOISE_COMBINED;
+    s.steps[0] = make_step("cpu_warmup", WK_CPU_BURN, 90, 2, NULL, "burst", "Разогрев CPU");
+    s.steps[1] = make_step("storage_heavy", WK_STORAGE, 180, 1, "8M", "steady", "Тяжёлая storage нагрузка");
+    s.steps[2] = make_step("network_tail", WK_PING, 90, 1, "8.8.8.8", "steady", "RTT under load");
+    s.steps[3] = make_step("jitter_check", WK_JITTER, 20, 1, "1000", "steady", "Проверка джиттера");
+    s.step_count = 4;
     set_primary_metrics(&s, metrics, 5);
   }
   else if (strcmp(name, "iot") == 0 || strcmp(name, "iot_controller") == 0)
   {
-    const char *metrics[] = {"cpu_util_pct_avg", "packet_loss_pct_avg", "ping_p99_ms_avg", "power_w_avg", "mem_used_pct_avg"};
+    const char *metrics[] = {"cpu_util_pct_avg", "mem_used_pct_avg", "ping_p95_ms_avg", "packet_loss_pct_avg", "power_w_avg"};
     s.name = "iot";
-    s.description = "IoT сценарий: опрос сенсоров, выгрузка телеметрии и окно сна";
+    s.description = "Сценарий контроллера интернета вещей";
     s.critical_temp_c = 80.0;
     s.target_ping_p99_ms = 20.0;
-    s.ref_perf_per_watt = 7000000.0;
     s.assumed_power_w = 3.0;
-    s.steps[0] = make_step("idle_baseline", WK_IDLE, 120, 0, NULL, "recovery", "Энергосберегающий фон IoT-контроллера");
-    s.steps[1] = make_step("sensor_batch_compute", WK_CPU_BURN, 60, 1, NULL, "burst", "Короткая обработка пачки показаний сенсоров");
-    s.steps[2] = make_step("persist_batch", WK_STORAGE, 45, 0, "1M", "burst", "Сохранение телеметрии на локальный носитель");
-    s.steps[3] = make_step("uplink_health", WK_PING, 60, 0, "1.1.1.1", "steady", "Проверка стабильности uplink до облака/роутера");
-    s.steps[4] = make_step("sleep_window", WK_IDLE, 180, 0, NULL, "recovery", "Окно сна для оценки среднего энергопрофиля");
+    s.steps[0] = make_step("idle_baseline", WK_IDLE, 60, 1, NULL, "recovery", "Фон");
+    s.steps[1] = make_step("cpu_burst", WK_CPU_BURN, 30, 1, NULL, "burst", "Короткий burst");
+    s.steps[2] = make_step("mem_burst", WK_MEMORY, 20, 1, "32M", "burst", "Memory burst");
+    s.steps[3] = make_step("network_probe", WK_PING, 60, 1, "1.1.1.1", "steady", "Uplink probe");
+    s.steps[4] = make_step("sleep_window", WK_IDLE, 90, 1, NULL, "recovery", "Окно сна");
     s.step_count = 5;
     set_primary_metrics(&s, metrics, 5);
   }
+  else if (strcmp(name, "embedded") == 0)
+  {
+    const char *metrics[] = {"cpu_ops_avg", "jitter_p99_us", "temp_c_max", "power_w_avg", "stability_score_pct"};
+    s.name = "embedded";
+    s.description = "Встраиваемый сценарий";
+    s.critical_temp_c = 85.0;
+    s.target_ping_p99_ms = 35.0;
+    s.steps[0] = make_step("boot_settle", WK_IDLE, 45, 1, NULL, "recovery", "Стабилизация");
+    s.steps[1] = make_step("control_cpu", WK_CPU_BURN, 90, 2, NULL, "steady", "Контрольный цикл CPU");
+    s.steps[2] = make_step("control_memory", WK_MEMORY, 45, 1, "64M", "steady", "Контроль памяти");
+    s.steps[3] = make_step("control_jitter", WK_JITTER, 25, 1, "1000", "steady", "Реакция таймера");
+    s.step_count = 4;
+    set_primary_metrics(&s, metrics, 5);
+  }
+  else if (strcmp(name, "neural_host") == 0 || strcmp(name, "neural") == 0)
+  {
+    const char *metrics[] = {"nn_inf_per_sec_avg", "perf_per_watt", "temp_c_max", "cpu_freq_mhz_avg", "mem_copy_mb_s_avg"};
+    s.name = "neural_host";
+    s.description = "Нейросетевой сценарий (лёгкая матричная нагрузка)";
+    s.critical_temp_c = 90.0;
+    s.target_ping_p99_ms = 40.0;
+    s.steps[0] = make_step("nn_warmup", WK_NN, 90, 2, "32", "burst", "Прогрев матриц");
+    s.steps[1] = make_step("nn_steady", WK_NN, 240, 2, "48", "steady", "Стабильный инференс");
+    s.steps[2] = make_step("mem_support", WK_MEMORY, 60, 1, "128M", "steady", "Поддерживающий memory тест");
+    s.step_count = 3;
+    set_primary_metrics(&s, metrics, 5);
+  }
+  else if (strcmp(name, "manual") == 0)
+  {
+    return build_manual_scenario_from_prompt();
+  }
   else
   {
-    const char *metrics[] = {"cpu_ops_avg", "storage_mb_s_avg", "ping_p99_ms_avg", "thermal_headroom_pct"};
+    const char *metrics[] = {"cpu_ops_avg", "mem_copy_mb_s_avg", "storage_mb_s_avg", "ping_p95_ms_avg", "jitter_p99_us"};
     s.name = "baseline";
-    s.description = "Базовый сценарий: CPU + storage + network для первичного сравнения плат";
-    s.steps[0] = make_step("boot_settle", WK_IDLE, 30, 0, NULL, "recovery", "Фиксация стартового состояния");
-    s.steps[1] = make_step("cpu_warmup", WK_CPU_BURN, 120, 2, NULL, "burst", "Краткий стартовый стресс CPU");
-    s.steps[2] = make_step("storage_probe", WK_STORAGE, 90, 0, "4M", "burst", "Проверка скоростей записи на файловую систему");
-    s.steps[3] = make_step("network_probe", WK_PING, 45, 0, "1.1.1.1", "steady", "Оценка сетевой задержки p99");
-    s.steps[4] = make_step("cpu_steady", WK_CPU_BURN, 300, 2, NULL, "steady", "Устойчивость под продолжительной нагрузкой");
+    s.description = "Базовый сценарий";
+    s.steps[0] = make_step("cpu_base", WK_CPU_BURN, 60, 2, NULL, "steady", "CPU");
+    s.steps[1] = make_step("mem_base", WK_MEMORY, 30, 1, "64M", "steady", "Memory");
+    s.steps[2] = make_step("storage_base", WK_STORAGE, 60, 1, "4M", "steady", "Storage");
+    s.steps[3] = make_step("network_base", WK_PING, 45, 1, "1.1.1.1", "steady", "RTT");
+    s.steps[4] = make_step("jitter_base", WK_JITTER, 15, 1, "1000", "steady", "Jitter");
     s.step_count = 5;
-    set_primary_metrics(&s, metrics, 4);
+    set_primary_metrics(&s, metrics, 5);
   }
-  return s;
-}
 
-static int read_line_stdin(char *buf, size_t n)
-{
-  if (!fgets(buf, (int)n, stdin))
-    return -1;
-  size_t len = strlen(buf);
-  while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
-    buf[--len] = '\0';
-  return 0;
+  return s;
 }
 
 double parse_duration_scale(const char *in, double fallback)
@@ -193,49 +254,19 @@ double parse_duration_scale(const char *in, double fallback)
   return v;
 }
 
-static int custom_metric_enabled(const char *line, int idx)
-{
-  if (!line || !*line)
-    return 1;
-  char token[8];
-  snprintf(token, sizeof(token), "%d", idx);
-  return strstr(line, token) != NULL;
-}
-
 Scenario build_custom_scenario_from_prompt(void)
 {
-  Scenario s = scenario_from_name("baseline");
-  s.name = "baseline";
-  s.description = "Custom profile: вручную выбранные метрики на базовом наборе шагов";
+  return build_manual_scenario_from_prompt();
+}
 
-  fprintf(stdout, "\n[Custom] Выбор важных метрик (через пробел, Enter = все):\n");
-  fprintf(stdout, " 1=cpu_ops_avg 2=storage_mb_s_avg 3=ping_p99_ms_avg 4=thermal_headroom_pct 5=power_w_avg 6=mem_used_pct_avg\n");
-  fprintf(stdout, " > ");
-  char line[256];
-  if (read_line_stdin(line, sizeof(line)) != 0)
-    line[0] = '\0';
-
-  const char *selected[8];
-  int nsel = 0;
-  if (custom_metric_enabled(line, 1))
-    selected[nsel++] = "cpu_ops_avg";
-  if (custom_metric_enabled(line, 2))
-    selected[nsel++] = "storage_mb_s_avg";
-  if (custom_metric_enabled(line, 3))
-    selected[nsel++] = "ping_p99_ms_avg";
-  if (custom_metric_enabled(line, 4))
-    selected[nsel++] = "thermal_headroom_pct";
-  if (custom_metric_enabled(line, 5))
-    selected[nsel++] = "power_w_avg";
-  if (custom_metric_enabled(line, 6))
-    selected[nsel++] = "mem_used_pct_avg";
-  if (nsel == 0)
-    selected[nsel++] = "cpu_ops_avg";
-
-  s.primary_metric_count = 0;
-  for (int i = 0; i < nsel; ++i)
-    s.primary_metrics[s.primary_metric_count++] = selected[i];
-  return s;
+static int read_line_stdin(char *buf, size_t n)
+{
+  if (!fgets(buf, (int)n, stdin))
+    return -1;
+  size_t len = strlen(buf);
+  while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
+    buf[--len] = '\0';
+  return 0;
 }
 
 static void print_console_header(void)
@@ -243,18 +274,20 @@ static void print_console_header(void)
   fprintf(stdout, "\n============================================================\n");
   fprintf(stdout, " SBC BENCHMARK v4 - SCENARIO CONSOLE\n");
   fprintf(stdout, "============================================================\n");
-  fprintf(stdout, "1) Custom (base profile)\n");
-  fprintf(stdout, "2) IoT controller\n");
-  fprintf(stdout, "3) Embedded control\n");
-  fprintf(stdout, "4) Neural inference\n");
-  fprintf(stdout, "5) Gateway / data server\n");
+  fprintf(stdout, "1) Базовый тест\n");
+  fprintf(stdout, "2) Длительный тест устойчивости\n");
+  fprintf(stdout, "3) Периферийный сервер\n");
+  fprintf(stdout, "4) Контроллер IoT\n");
+  fprintf(stdout, "5) Встраиваемый сценарий\n");
+  fprintf(stdout, "6) Нейросетевой сценарий\n");
+  fprintf(stdout, "7) Ручной выбор тестов\n");
   fprintf(stdout, "------------------------------------------------------------\n");
 }
 
 static int prompt_report_mode(int *replace_latest)
 {
   char line[32];
-  fprintf(stdout, "Report mode: [1] separate timestamped run (default), [2] replace <scenario>_latest: ");
+  fprintf(stdout, "Режим отчёта: [1] новый run (по умолчанию), [2] заменить <scenario>_latest: ");
   if (read_line_stdin(line, sizeof(line)) != 0)
     return -1;
   *replace_latest = (strcmp(line, "2") == 0);
@@ -267,27 +300,32 @@ int show_interactive_menu(char out_scenario[64], double *out_scale, int *use_cus
   while (1)
   {
     print_console_header();
-    fprintf(stdout, "6) List scenario details\n");
-    fprintf(stdout, "7) Run all scenarios (sequential)\n");
-    fprintf(stdout, "8) Analyze latest run\n");
-    fprintf(stdout, "0) Exit\n\n");
-    fprintf(stdout, "Select option (0-8): ");
+    fprintf(stdout, "8) Показать описание сценариев\n");
+    fprintf(stdout, "9) Запустить все сценарии\n");
+    fprintf(stdout, "a) Анализ последнего прогона\n");
+    fprintf(stdout, "q) Выход\n\n");
+    fprintf(stdout, "Выбор (1-9, a, q): ");
+
     if (read_line_stdin(line, sizeof(line)) != 0)
       return -1;
-    if (strcmp(line, "0") == 0)
+
+    if (strcmp(line, "q") == 0 || strcmp(line, "Q") == 0)
       return 0;
-    if (strcmp(line, "6") == 0)
+
+    if (strcmp(line, "8") == 0)
     {
       print_scenario_catalog();
       continue;
     }
-    if (strcmp(line, "7") == 0)
+
+    if (strcmp(line, "9") == 0)
     {
       *use_custom = 0;
       *replace_latest = 0;
       snprintf(out_scenario, 64, "__all__");
-      fprintf(stdout, "\nSelected: run all scenarios (baseline/iot/embedded/neural_host/server_gateway)\n");
-      fprintf(stdout, "Duration scale (Enter = 0.05 for short run): ");
+      fprintf(stdout, "\nБудут запущены все сценарии. ");
+      fprintf(stdout, "Это может занять длительное время.\n");
+      fprintf(stdout, "Масштаб длительности (Enter=0.05): ");
       if (read_line_stdin(line, sizeof(line)) != 0)
         return -1;
       *out_scale = parse_duration_scale(line, 0.05);
@@ -295,7 +333,8 @@ int show_interactive_menu(char out_scenario[64], double *out_scale, int *use_cus
         return -1;
       return 1;
     }
-    if (strcmp(line, "8") == 0)
+
+    if (strcmp(line, "a") == 0 || strcmp(line, "A") == 0)
     {
       *use_custom = 0;
       *replace_latest = 0;
@@ -305,36 +344,48 @@ int show_interactive_menu(char out_scenario[64], double *out_scale, int *use_cus
     }
 
     int choice = atoi(line);
-    if (choice < 1 || choice > 5)
+    if (choice < 1 || choice > 7)
     {
-      fprintf(stdout, "Unknown option: %s\n", line);
+      fprintf(stdout, "Неизвестная опция: %s\n", line);
       continue;
     }
 
     snprintf(out_scenario, 64, "%s", g_scenario_entries[choice - 1].key);
-    *use_custom = (choice == 1);
-    fprintf(stdout, "\nSelected: %s\n%s\n", g_scenario_entries[choice - 1].title, g_scenario_entries[choice - 1].description);
-    fprintf(stdout, "Duration scale (Enter = 1.0, example 0.10 for short run): ");
+    *use_custom = (choice == 7);
+
+    fprintf(stdout, "\nВыбран сценарий: %s\n", g_scenario_entries[choice - 1].title);
+    fprintf(stdout, "%s\n", g_scenario_entries[choice - 1].description);
+    fprintf(stdout, "Масштаб длительности (Enter=1.0): ");
     if (read_line_stdin(line, sizeof(line)) != 0)
       return -1;
     *out_scale = parse_duration_scale(line, 1.0);
+
     if (prompt_report_mode(replace_latest) != 0)
       return -1;
+
     return 1;
   }
 }
 
 void print_execution_plan(const Scenario *sc)
 {
-  fprintf(stdout, "\nScenario plan: %s\n", sc->name);
-  fprintf(stdout, "Description: %s\n", sc->description ? sc->description : "n/a");
-  fprintf(stdout, "Primary metrics: ");
+  fprintf(stdout, "\nПлан сценария: %s\n", sc->name);
+  fprintf(stdout, "Описание: %s\n", sc->description ? sc->description : "n/a");
+  fprintf(stdout, "Основные метрики: ");
   for (int i = 0; i < sc->primary_metric_count; ++i)
     fprintf(stdout, "%s%s", sc->primary_metrics[i], (i + 1 < sc->primary_metric_count) ? ", " : "\n");
+
+  fprintf(stdout, "Noise mode: %d\n", (int)sc->noise_mode);
+
   for (int i = 0; i < sc->step_count; ++i)
   {
     const Step *st = &sc->steps[i];
-    fprintf(stdout, "  %d) %s | %s | %ds | load=%s\n", i + 1, st->name, kind_name_local(st->kind), st->duration_sec,
+    fprintf(stdout, "  %d) %s | %s | %d sec | threads=%d | load=%s\n",
+            i + 1,
+            st->name,
+            kind_name_local(st->kind),
+            st->duration_sec,
+            st->threads,
             st->load_profile ? st->load_profile : "n/a");
     if (st->purpose && st->purpose[0])
       fprintf(stdout, "     - %s\n", st->purpose);
@@ -345,11 +396,13 @@ void print_execution_plan(const Scenario *sc)
 int is_valid_scenario_name(const char *scenario_name)
 {
   return strcmp(scenario_name, "baseline") == 0 ||
+         strcmp(scenario_name, "long_soak") == 0 ||
+         strcmp(scenario_name, "soak") == 0 ||
+         strcmp(scenario_name, "server_gateway") == 0 ||
          strcmp(scenario_name, "iot") == 0 ||
          strcmp(scenario_name, "iot_controller") == 0 ||
-         strcmp(scenario_name, "server_gateway") == 0 ||
-         strcmp(scenario_name, "server_edge") == 0 ||
          strcmp(scenario_name, "embedded") == 0 ||
          strcmp(scenario_name, "neural_host") == 0 ||
-         strcmp(scenario_name, "neural") == 0;
+         strcmp(scenario_name, "neural") == 0 ||
+         strcmp(scenario_name, "manual") == 0;
 }
