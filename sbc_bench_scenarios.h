@@ -11,13 +11,14 @@ void print_scenario_catalog(void);
 Scenario scenario_from_name(const char *name);
 double parse_duration_scale(const char *in, double fallback);
 
+/* Для ручного выбора отдельных тестов */
 Scenario build_custom_scenario_from_prompt(void);
 
 /*
- * Interactive menu:
- * return 1 -> scenario selected
- * return 0 -> user exit
- * return -1 -> input/error
+ * return:
+ *  1 - сценарий выбран
+ *  0 - выход
+ * -1 - ошибка ввода
  */
 int show_interactive_menu(char out_scenario[64], double *out_scale, int *use_custom, int *replace_latest);
 

@@ -14,8 +14,8 @@
 #define MAX_STEPS 32
 #define MAX_CPUS 256
 #define MAX_WARNINGS 128
-#define MAX_RUN_ERRORS 128
-#define MAX_SAMPLES_PER_TEST 200000
+#define MAX_ERRORS 128
+#define MAX_STAT_POINTS 200000
 
 typedef enum
 {
@@ -51,11 +51,13 @@ typedef struct
 {
   const char *name;
   const char *description;
+
   int sample_sec;
   double critical_temp_c;
   double target_ping_p99_ms;
   double ref_perf_per_watt;
   double assumed_power_w;
+
   NoiseMode noise_mode;
 
   const char *primary_metrics[16];
@@ -87,35 +89,35 @@ typedef struct
 
 typedef struct
 {
+  double avg;
+  double median;
+  double p95;
+  double p99;
+  double p999;
+  double max;
+  uint64_t outliers;
+} StatsSummary;
+
+typedef struct
+{
   const Step *step;
+
+  /* CPU */
   double ops_per_sec;
-  double throughput_mb_s;
-  double ping_p99_ms;
-  double packet_loss_pct;
+  double ops_window_start;
+  double ops_window_end;
+  double cpu_degradation_pct;
+
+  /* NN */
   double nn_inf_per_sec;
 
-  /* memory */
+  /* Memory */
   double mem_read_mb_s;
   double mem_write_mb_s;
   double mem_copy_mb_s;
 
-  /* jitter */
-  double jitter_avg_us;
-  double jitter_p50_us;
-  double jitter_p95_us;
-  double jitter_p99_us;
-  double jitter_max_us;
-  uint64_t jitter_over_500us;
-  uint64_t jitter_over_1000us;
-
-  /* network extended */
-  double ping_min_ms;
-  double ping_avg_ms;
-  double ping_max_ms;
-  double ping_p95_ms;
-  uint64_t ping_errors;
-
-  /* storage extended */
+  /* Storage */
+  double throughput_mb_s;
   double storage_iops;
   double storage_lat_avg_us;
   double storage_lat_p50_us;
@@ -124,6 +126,24 @@ typedef struct
   double storage_lat_p999_us;
   double storage_lat_max_us;
   uint64_t storage_outliers;
+
+  /* Network */
+  double ping_min_ms;
+  double ping_avg_ms;
+  double ping_max_ms;
+  double ping_p95_ms;
+  double ping_p99_ms;
+  double packet_loss_pct;
+  uint64_t ping_errors;
+
+  /* Jitter */
+  double jitter_avg_us;
+  double jitter_p50_us;
+  double jitter_p95_us;
+  double jitter_p99_us;
+  double jitter_max_us;
+  uint64_t jitter_over_500us;
+  uint64_t jitter_over_1000us;
 } StepResult;
 
 typedef struct
@@ -142,18 +162,8 @@ typedef struct
   char warnings[MAX_WARNINGS][256];
   int warning_count;
 
-  char errors[MAX_RUN_ERRORS][256];
+  char errors[MAX_ERRORS][256];
   int error_count;
 } RunMessages;
-
-typedef struct
-{
-  double avg;
-  double median;
-  double p95;
-  double p99;
-  double p999;
-  double max;
-} StatsSummary;
 
 #endif
