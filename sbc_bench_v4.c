@@ -30,8 +30,10 @@
 #include "sbc_bench_scenarios.h"
 #include "sbc_bench_metrics.h"
 #include "sbc_bench_noise.h"
+#include "sbc_bench_coordinator.h"
 
 static volatile sig_atomic_t g_stop = 0;
+static RunMessages g_run_msgs;
 
 typedef struct
 {
@@ -59,6 +61,16 @@ static void series_free(Series *s)
   free(s->v);
   s->v = NULL;
   s->n = s->cap = 0;
+}
+
+static void add_warning(const char *msg)
+{
+  if (!msg || !*msg)
+    return;
+  if (g_run_msgs.warning_count >= MAX_WARNINGS)
+    return;
+  snprintf(g_run_msgs.warnings[g_run_msgs.warning_count], sizeof(g_run_msgs.warnings[g_run_msgs.warning_count]), "%s", msg);
+  g_run_msgs.warning_count++;
 }
 
 static void setup_console_encoding(void)
@@ -204,6 +216,34 @@ static int list_cpu_freq_paths(char paths[MAX_CPUS][PATH_MAX])
       strncpy(paths[n++], p, PATH_MAX - 1);
   }
   return n;
+}
+
+static void detect_telemetry_channel_warnings(void)
+{
+  int thermal_ok = 0;
+  for (int i = 0; i < 128; ++i)
+  {
+    char p[PATH_MAX];
+    snprintf(p, sizeof(p), "/sys/class/thermal/thermal_zone%d/temp", i);
+    if (access(p, R_OK) == 0)
+    {
+      thermal_ok = 1;
+      break;
+    }
+  }
+  if (!thermal_ok)
+    add_warning("telemetry: thermal zones are unavailable");
+
+  char paths[MAX_CPUS][PATH_MAX];
+  if (list_cpu_freq_paths(paths) <= 0)
+    add_warning("telemetry: cpu frequency channels are unavailable");
+
+  if (access("/proc/pressure/cpu", R_OK) != 0)
+    add_warning("telemetry: PSI cpu is unavailable");
+  if (access("/proc/pressure/io", R_OK) != 0)
+    add_warning("telemetry: PSI io is unavailable");
+  if (access("/proc/pressure/memory", R_OK) != 0)
+    add_warning("telemetry: PSI memory is unavailable");
 }
 
 static double read_max_temp_c(void)
@@ -422,7 +462,6 @@ static double run_cpu_burn(const Step *s, double *window_start_ops, double *wind
   memset(counters, 0, sizeof(counters));
 
   volatile sig_atomic_t stop = 0;
-  double t0 = now_sec();
 
   for (int i = 0; i < n; ++i)
   {
@@ -431,25 +470,21 @@ static double run_cpu_burn(const Step *s, double *window_start_ops, double *wind
     pthread_create(&th[i], NULL, burn_worker, &args[i]);
   }
 
-  int total_ticks = s->duration_sec * 10;
-  if (total_ticks < 1)
-    total_ticks = 1;
-  int mid_tick = total_ticks / 2;
+  double t0 = now_sec();
+  double mid = t0 + s->duration_sec * 0.5;
+  uint64_t mid_ops = 0, end_ops = 0;
 
-  uint64_t first_half = 0, second_half = 0;
-
-  for (int tick = 0; tick < total_ticks && !g_stop; ++tick)
+  while (!g_stop && now_sec() - t0 < s->duration_sec)
   {
-    sleep_100ms();
-
-    uint64_t cur = 0;
+    uint64_t sum = 0;
     for (int i = 0; i < n; ++i)
-      cur += counters[i];
+      sum += counters[i];
 
-    if (tick < mid_tick)
-      first_half = cur;
-    else
-      second_half = cur - first_half;
+    if (now_sec() < mid)
+      mid_ops = sum;
+    end_ops = sum;
+
+    sleep_100ms();
   }
 
   stop = 1;
@@ -457,203 +492,171 @@ static double run_cpu_burn(const Step *s, double *window_start_ops, double *wind
     pthread_join(th[i], NULL);
 
   double elapsed = now_sec() - t0;
-  uint64_t total = 0;
-  for (int i = 0; i < n; ++i)
-    total += counters[i];
+  if (elapsed <= 0)
+    elapsed = 1e-6;
 
-  double total_ops = elapsed > 0 ? (double)total / elapsed : 0.0;
+  const double total_ops = (double)end_ops;
+  const double ops_sec = total_ops / elapsed;
 
-  double half_sec = (double)(s->duration_sec) / 2.0;
-  if (half_sec <= 0.0)
-    half_sec = 1.0;
+  const double first_window = (double)mid_ops / (elapsed * 0.5 > 0 ? elapsed * 0.5 : 1e-6);
+  const double second_window = (double)(end_ops - mid_ops) / (elapsed * 0.5 > 0 ? elapsed * 0.5 : 1e-6);
 
-  *window_start_ops = (double)first_half / half_sec;
-  *window_end_ops = (double)second_half / half_sec;
-  *degradation_pct = calc_degradation_percent(*window_start_ops, *window_end_ops);
+  *window_start_ops = first_window;
+  *window_end_ops = second_window;
+  *degradation_pct = calc_degradation_percent(first_window, second_window);
 
-  return total_ops;
+  return ops_sec;
 }
-
-/* --- NN --- */
-
-typedef struct
-{
-  volatile sig_atomic_t *stop;
-  uint64_t *counter;
-  int width;
-} NnArgs;
-
-static void *nn_worker(void *arg)
-{
-  NnArgs *a = (NnArgs *)arg;
-  int w = a->width;
-  int n = w * w;
-
-  float *m1 = (float *)malloc((size_t)n * sizeof(float));
-  float *m2 = (float *)malloc((size_t)n * sizeof(float));
-  float *out = (float *)malloc((size_t)n * sizeof(float));
-  if (!m1 || !m2 || !out)
-  {
-    free(m1);
-    free(m2);
-    free(out);
-    return NULL;
-  }
-
-  for (int i = 0; i < n; ++i)
-  {
-    m1[i] = (float)((i * 13 + 7) % 31) / 31.0f;
-    m2[i] = (float)((i * 17 + 3) % 37) / 37.0f;
-    out[i] = 0.0f;
-  }
-
-  uint64_t c = 0;
-  while (!*(a->stop) && !g_stop)
-  {
-    for (int r = 0; r < w; ++r)
-    {
-      int ro = r * w;
-      for (int col = 0; col < w; ++col)
-      {
-        float acc = 0.0f;
-        for (int k = 0; k < w; ++k)
-          acc += m1[ro + k] * m2[k * w + col];
-        out[ro + col] = acc;
-      }
-    }
-    c++;
-    *(a->counter) = c;
-  }
-
-  free(m1);
-  free(m2);
-  free(out);
-  return NULL;
-}
-
 static double run_nn_inference(const Step *s)
 {
-  int threads = s->threads > 0 ? s->threads : 1;
-  if (threads > MAX_CPUS)
-    threads = MAX_CPUS;
-
-  int width = 32;
+  int n = s->threads > 0 ? s->threads : 1;
+  int dim = 32;
   if (s->arg)
   {
-    int w = atoi(s->arg);
-    if (w >= 8 && w <= 256)
-      width = w;
+    int v = atoi(s->arg);
+    if (v >= 8 && v <= 128)
+      dim = v;
   }
 
-  pthread_t th[MAX_CPUS];
-  NnArgs args[MAX_CPUS];
-  uint64_t counters[MAX_CPUS];
-  memset(counters, 0, sizeof(counters));
-  volatile sig_atomic_t stop = 0;
+  size_t sz = (size_t)dim * (size_t)dim;
+  float *A = (float *)malloc(sz * sizeof(float));
+  float *B = (float *)malloc(sz * sizeof(float));
+  float *C = (float *)malloc(sz * sizeof(float));
+  if (!A || !B || !C)
+  {
+    free(A);
+    free(B);
+    free(C);
+    return -1.0;
+  }
+
+  for (size_t i = 0; i < sz; ++i)
+  {
+    A[i] = (float)((i % 13) * 0.1);
+    B[i] = (float)((i % 7) * 0.2);
+    C[i] = 0.0f;
+  }
 
   double t0 = now_sec();
-  for (int i = 0; i < threads; ++i)
+  uint64_t iters = 0;
+
+  while (!g_stop && now_sec() - t0 < s->duration_sec)
   {
-    args[i].stop = &stop;
-    args[i].counter = &counters[i];
-    args[i].width = width;
-    pthread_create(&th[i], NULL, nn_worker, &args[i]);
+    for (int t = 0; t < n; ++t)
+    {
+      for (int i = 0; i < dim; ++i)
+      {
+        for (int j = 0; j < dim; ++j)
+        {
+          float acc = 0.0f;
+          for (int k = 0; k < dim; ++k)
+            acc += A[(size_t)i * dim + k] * B[(size_t)k * dim + j];
+          C[(size_t)i * dim + j] = acc;
+        }
+      }
+    }
+    iters++;
   }
-
-  for (int i = 0; i < s->duration_sec * 10 && !g_stop; ++i)
-    sleep_100ms();
-
-  stop = 1;
-  for (int i = 0; i < threads; ++i)
-    pthread_join(th[i], NULL);
 
   double elapsed = now_sec() - t0;
-  uint64_t total = 0;
-  for (int i = 0; i < threads; ++i)
-    total += counters[i];
-  return elapsed > 0 ? (double)total / elapsed : 0.0;
+  free(A);
+  free(B);
+  free(C);
+
+  if (elapsed <= 0.0)
+    return -1.0;
+  return (double)iters / elapsed;
 }
 
-/* --- MEMORY read/write/copy --- */
-
-static int parse_mem_size(const char *arg, size_t *bytes)
+static size_t parse_mem_bytes(const char *arg)
 {
-  if (!bytes)
-    return -1;
-  size_t b = 64u * 1024u * 1024u; /* default 64MB */
-  if (arg && *arg)
-  {
-    unsigned long long v = 0;
-    char suf = 0;
-    if (sscanf(arg, "%llu%c", &v, &suf) >= 1)
-    {
-      if (suf == 'M' || suf == 'm')
-        b = (size_t)v * 1024u * 1024u;
-      else if (suf == 'K' || suf == 'k')
-        b = (size_t)v * 1024u;
-      else
-        b = (size_t)v;
-    }
-  }
-  if (b < 1024u * 1024u)
-    b = 1024u * 1024u;
-  if (b > 512u * 1024u * 1024u)
-    b = 512u * 1024u * 1024u; /* safety */
-  *bytes = b;
-  return 0;
+  if (!arg || !*arg)
+    return 64u * 1024u * 1024u;
+  char *end = NULL;
+  long long v = strtoll(arg, &end, 10);
+  if (end == arg || v <= 0)
+    return 64u * 1024u * 1024u;
+
+  size_t mul = 1;
+  if (*end == 'K' || *end == 'k')
+    mul = 1024u;
+  else if (*end == 'M' || *end == 'm')
+    mul = 1024u * 1024u;
+  else if (*end == 'G' || *end == 'g')
+    mul = 1024u * 1024u * 1024u;
+
+  size_t out = (size_t)v * mul;
+  if (out < 1024u * 1024u)
+    out = 1024u * 1024u;
+  if (out > 1024u * 1024u * 1024u)
+    out = 1024u * 1024u * 1024u;
+  return out;
 }
 
 static void run_memory_test(const Step *s, double *read_mb_s, double *write_mb_s, double *copy_mb_s)
 {
   *read_mb_s = *write_mb_s = *copy_mb_s = -1.0;
 
-  size_t bytes = 0;
-  if (parse_mem_size(s->arg, &bytes) != 0)
-    return;
+  const size_t nbytes = parse_mem_bytes(s->arg);
+  const size_t n = nbytes / sizeof(uint64_t);
 
-  uint8_t *a = NULL, *b = NULL;
-  if (posix_memalign_portable((void **)&a, 64, bytes) != 0)
-    return;
-  if (posix_memalign_portable((void **)&b, 64, bytes) != 0)
+  uint64_t *a = NULL, *b = NULL;
+  if (posix_memalign_portable((void **)&a, 64, nbytes) != 0 ||
+      posix_memalign_portable((void **)&b, 64, nbytes) != 0 ||
+      !a || !b)
   {
-    free_aligned_portable(a);
+    if (a)
+      free_aligned_portable(a);
+    if (b)
+      free_aligned_portable(b);
     return;
   }
 
-  memset(a, 0x11, bytes);
-  memset(b, 0x22, bytes);
+  for (size_t i = 0; i < n; ++i)
+  {
+    a[i] = (uint64_t)i;
+    b[i] = 0;
+  }
 
-  volatile uint64_t sink = 0;
-
-  /* write */
   double t0 = now_sec();
-  for (size_t i = 0; i < bytes; i += 64)
-    a[i] = (uint8_t)(i & 0xffu);
+  uint64_t rounds = 0;
+
+  while (!g_stop && now_sec() - t0 < s->duration_sec)
+  {
+    for (size_t i = 0; i < n; ++i)
+      a[i] = a[i] * 1664525u + 1013904223u;
+    rounds++;
+  }
   double t1 = now_sec();
 
-  /* read */
-  for (size_t i = 0; i < bytes; i += 64)
+  volatile uint64_t sink = 0;
+  double r0 = now_sec();
+  for (size_t i = 0; i < n; ++i)
     sink += a[i];
-  double t2 = now_sec();
+  double r1 = now_sec();
 
-  /* copy */
-  memcpy(b, a, bytes);
-  double t3 = now_sec();
-
-  double mb = (double)bytes / (1024.0 * 1024.0);
-  if (t1 > t0)
-    *write_mb_s = mb / (t1 - t0);
-  if (t2 > t1)
-    *read_mb_s = mb / (t2 - t1);
-  if (t3 > t2)
-    *copy_mb_s = mb / (t3 - t2);
+  double c0 = now_sec();
+  memcpy(b, a, nbytes);
+  double c1 = now_sec();
 
   (void)sink;
+
+  double elapsed_write = t1 - t0;
+  double elapsed_read = r1 - r0;
+  double elapsed_copy = c1 - c0;
+
+  double total_mb = ((double)nbytes * (double)rounds) / (1024.0 * 1024.0);
+
+  if (elapsed_write > 0)
+    *write_mb_s = total_mb / elapsed_write;
+  if (elapsed_read > 0)
+    *read_mb_s = ((double)nbytes / (1024.0 * 1024.0)) / elapsed_read;
+  if (elapsed_copy > 0)
+    *copy_mb_s = ((double)nbytes / (1024.0 * 1024.0)) / elapsed_copy;
+
   free_aligned_portable(a);
   free_aligned_portable(b);
 }
-
-/* --- JITTER --- */
 
 static void run_jitter_test(const Step *s,
                             double *j_avg, double *j_p50, double *j_p95, double *j_p99, double *j_max,
@@ -665,16 +668,16 @@ static void run_jitter_test(const Step *s,
   int period_us = 1000;
   if (s->arg)
   {
-    int p = atoi(s->arg);
-    if (p >= 100 && p <= 100000)
-      period_us = p;
+    int v = atoi(s->arg);
+    if (v >= 100 && v <= 100000)
+      period_us = v;
   }
 
   int samples = s->duration_sec * 1000000 / period_us;
-  if (samples < 100)
-    samples = 100;
+  if (samples < 10)
+    samples = 10;
   if (samples > (int)MAX_STAT_POINTS)
-    samples = MAX_STAT_POINTS;
+    samples = (int)MAX_STAT_POINTS;
 
   Series ser;
   series_init(&ser, (size_t)samples);
@@ -770,6 +773,7 @@ static double run_storage(const Step *s, const char *out_dir,
   series_init(&lat, MAX_STAT_POINTS);
 
   uint64_t written = 0;
+  uint64_t read_bytes = 0;
   uint64_t ops = 0;
   double t0 = now_sec();
 
@@ -794,6 +798,41 @@ static double run_storage(const Step *s, const char *out_dir,
 
     written += (uint64_t)wr;
     ops++;
+
+    if (lseek(fd, 0, SEEK_SET) >= 0)
+    {
+      double ra = now_sec();
+      ssize_t rd = read(fd, buf, block);
+      double rb = now_sec();
+      if (rd > 0)
+      {
+        read_bytes += (uint64_t)rd;
+        double lat_r_us = (rb - ra) * 1e6;
+        series_push(&lat, lat_r_us);
+        if (df)
+          fprintf(df, "seq_read,%.3f\n", lat_r_us);
+        ops++;
+      }
+    }
+
+    if (written > block)
+    {
+      off_t max_off = (off_t)(written - block);
+      off_t off = (off_t)((uint64_t)rand() % (uint64_t)(max_off + 1));
+      off = (off / 4096) * 4096;
+      double rra = now_sec();
+      ssize_t rrd = pread(fd, buf, block, off);
+      double rrb = now_sec();
+      if (rrd > 0)
+      {
+        read_bytes += (uint64_t)rrd;
+        double lat_rr_us = (rrb - rra) * 1e6;
+        series_push(&lat, lat_rr_us);
+        if (df)
+          fprintf(df, "random_read,%.3f\n", lat_rr_us);
+        ops++;
+      }
+    }
   }
 
   /* metadata ops */
@@ -817,6 +856,24 @@ static double run_storage(const Step *s, const char *out_dir,
     if (df)
       fprintf(df, "create_unlink,%.3f\n", lat_us);
     ops++;
+  }
+
+  for (int i = 0; i < 16 && !g_stop; ++i)
+  {
+    char dpath[PATH_MAX];
+    snprintf(dpath, sizeof(dpath), "%s/bench_dir_%d", out_dir, i);
+    double a = now_sec();
+    int mk = mkdir_portable(dpath, 0755);
+    int rm = (mk == 0) ? rmdir(dpath) : -1;
+    double b = now_sec();
+    if (mk == 0 && rm == 0)
+    {
+      double lat_us = (b - a) * 1e6;
+      series_push(&lat, lat_us);
+      if (df)
+        fprintf(df, "mkdir_rmdir,%.3f\n", lat_us);
+      ops++;
+    }
   }
 
   if (df)
@@ -851,80 +908,81 @@ static double run_storage(const Step *s, const char *out_dir,
 
   if (elapsed <= 0.0)
     return -1.0;
-  return ((double)written / (1024.0 * 1024.0)) / elapsed;
+  return ((double)(written + read_bytes) / (1024.0 * 1024.0)) / elapsed;
 }
 
 /* ping parser + extended metrics */
 static void run_ping(const Step *s,
                      double *loss_pct, double *p95, double *p99,
                      double *minv, double *avgv, double *maxv,
-                     uint64_t *errors,
-                     const char *out_dir)
+                     uint64_t *errors, const char *out_dir)
 {
-  *loss_pct = -1.0;
-  *p95 = -1.0;
-  *p99 = -1.0;
-  *minv = *avgv = *maxv = -1.0;
+  *loss_pct = *p95 = *p99 = *minv = *avgv = *maxv = -1.0;
   *errors = 0;
 
-  char cmd[512];
-  const char *host = s->arg ? s->arg : "1.1.1.1";
-  snprintf(cmd, sizeof(cmd), "ping -i 0.2 -w %d %s 2>&1", s->duration_sec, host);
+  const char *host = (s->arg && *s->arg) ? s->arg : "1.1.1.1";
 
-  char detail_csv[PATH_MAX];
-  FILE *df = NULL;
-  if (join_path(detail_csv, sizeof(detail_csv), out_dir, "network_detail.csv") == 0)
-  {
-    df = fopen(detail_csv, "w");
-    if (df)
-      fprintf(df, "seq,rtt_ms\n");
-  }
+  char cmd[512];
+  snprintf(cmd, sizeof(cmd), "ping -i 0.2 -w %d %s 2>&1", s->duration_sec, host);
 
   FILE *p = popen(cmd, "r");
   if (!p)
   {
-    if (df)
-      fclose(df);
+    *errors = 1;
     return;
   }
 
   Series rtts;
   series_init(&rtts, MAX_STAT_POINTS);
 
+  char detail_csv[PATH_MAX];
+  FILE *df = NULL;
+  if (out_dir && join_path(detail_csv, sizeof(detail_csv), out_dir, "network_detail.csv") == 0)
+  {
+    df = fopen(detail_csv, "w");
+    if (df)
+      fprintf(df, "rtt_ms\n");
+  }
+
   char line[1024];
-  int seq = 0;
   while (fgets(line, sizeof(line), p))
   {
     if (strstr(line, "time="))
     {
-      char *t = strstr(line, "time=");
-      if (t)
+      char *x = strstr(line, "time=");
+      if (x)
       {
-        double rtt = atof(t + 5);
-        if (rtt > 0.0)
+        x += 5;
+        double v = atof(x);
+        if (v >= 0.0)
         {
-          series_push(&rtts, rtt);
+          series_push(&rtts, v);
           if (df)
-            fprintf(df, "%d,%.3f\n", seq++, rtt);
+            fprintf(df, "%.3f\n", v);
         }
       }
     }
+
     if (strstr(line, "packet loss"))
     {
-      char *pct = strstr(line, "% packet loss");
+      char *pct = strstr(line, "%");
       if (pct)
       {
-        const char *x = pct;
+        char *x = pct;
         while (x > line && ((*(x - 1) >= '0' && *(x - 1) <= '9') || *(x - 1) == '.'))
-          x--;
+          --x;
         *loss_pct = atof(x);
       }
     }
-    if (strstr(line, "unknown host") || strstr(line, "Destination Host Unreachable"))
+
+    if (strstr(line, "unknown host") || strstr(line, "Name or service not known"))
       (*errors)++;
   }
 
-  pclose(p);
+  int rc = pclose(p);
+  if (rc != 0)
+    (*errors)++;
+
   if (df)
     fclose(df);
 
@@ -940,7 +998,6 @@ static void run_ping(const Step *s,
 
   series_free(&rtts);
 }
-
 /* ---------- per-test CSV ---------- */
 
 static void write_cpu_csv(const char *out_dir, const StepResult *res, int nres)
@@ -996,7 +1053,7 @@ static void write_storage_csv(const char *out_dir, const StepResult *res, int nr
   FILE *f = fopen(p, "w");
   if (!f)
     return;
-  fprintf(f, "step,mb_s,iops,lat_avg_us,lat_p50_us,lat_p95_us,lat_p99_us,lat_p999_us,lat_max_us,outliers\n");
+  fprintf(f, "step,throughput_mb_s,iops,lat_avg_us,lat_p50_us,lat_p95_us,lat_p99_us,lat_p999_us,lat_max_us,outliers\n");
   for (int i = 0; i < nres; ++i)
   {
     if (res[i].step->kind != WK_STORAGE)
@@ -1015,6 +1072,7 @@ static void write_storage_csv(const char *out_dir, const StepResult *res, int nr
   }
   fclose(f);
 }
+
 static void write_network_csv(const char *out_dir, const StepResult *res, int nres)
 {
   char p[PATH_MAX];
@@ -1023,19 +1081,19 @@ static void write_network_csv(const char *out_dir, const StepResult *res, int nr
   FILE *f = fopen(p, "w");
   if (!f)
     return;
-  fprintf(f, "step,min_ms,avg_ms,max_ms,p95_ms,p99_ms,loss_pct,errors\n");
+  fprintf(f, "step,loss_pct,p95_ms,p99_ms,min_ms,avg_ms,max_ms,errors\n");
   for (int i = 0; i < nres; ++i)
   {
     if (res[i].step->kind != WK_PING)
       continue;
     fprintf(f, "%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%" PRIu64 "\n",
             res[i].step->name,
+            res[i].packet_loss_pct,
+            res[i].ping_p95_ms,
+            res[i].ping_p99_ms,
             res[i].ping_min_ms,
             res[i].ping_avg_ms,
             res[i].ping_max_ms,
-            res[i].ping_p95_ms,
-            res[i].ping_p99_ms,
-            res[i].packet_loss_pct,
             res[i].ping_errors);
   }
   fclose(f);
@@ -1069,7 +1127,7 @@ static void write_jitter_csv(const char *out_dir, const StepResult *res, int nre
 
 /* ---------- run metadata ---------- */
 
-static void write_run_status(const char *run_dir, const char *status, const char *message)
+static void write_run_status(const char *run_dir, const char *status, const char *stage, const char *message)
 {
   char p[PATH_MAX];
   if (join_path(p, sizeof(p), run_dir, "run_status.json") != 0)
@@ -1077,9 +1135,12 @@ static void write_run_status(const char *run_dir, const char *status, const char
   FILE *f = fopen(p, "w");
   if (!f)
     return;
-  fprintf(f, "{\n  \"status\": \"%s\",\n  \"message\": \"%s\"\n}\n",
+  fprintf(f, "{\n  \"status\": \"%s\",\n  \"stage\": \"%s\",\n  \"message\": \"%s\",\n  \"warnings\": %d,\n  \"errors\": %d\n}\n",
           status ? status : "unknown",
-          message ? message : "");
+          stage ? stage : "unknown",
+          message ? message : "",
+          g_run_msgs.warning_count,
+          g_run_msgs.error_count);
   fclose(f);
 }
 
@@ -1246,7 +1307,7 @@ static void write_metrics_json(const char *run_dir, const Scenario *sc, const Co
   series_free(&temp);
 }
 
-static void write_report_md(const char *run_dir, const Scenario *sc, const Collector *c, const StepResult *res, int nres)
+static void write_report_md(const char *run_dir, const Scenario *sc, const Collector *c, const StepResult *res, int nres, const RunMessages *msgs, const RunContext *run_ctx, double run_sec)
 {
   char p[PATH_MAX];
   if (join_path(p, sizeof(p), run_dir, "report.md") != 0)
@@ -1258,8 +1319,40 @@ static void write_report_md(const char *run_dir, const Scenario *sc, const Colle
   fprintf(f, "# SBC Benchmark Report\n\n");
   fprintf(f, "- Scenario: **%s**\n", sc->name ? sc->name : "unknown");
   fprintf(f, "- Description: %s\n", sc->description ? sc->description : "");
+  fprintf(f, "- Run ID: `%s`\n", (run_ctx && run_ctx->run_id[0]) ? run_ctx->run_id : "n/a");
+  if (run_ctx && run_ctx->created_at > 0)
+    fprintf(f, "- Run date (epoch): %lld\n", (long long)run_ctx->created_at);
+  fprintf(f, "- Duration (sec): %.3f\n", run_sec);
   fprintf(f, "- Samples: %zu\n", c->nrows);
-  fprintf(f, "- Tests executed: %d\n\n", nres);
+  fprintf(f, "- Tests executed: %d of %d\n\n", nres, sc->step_count);
+
+  fprintf(f, "## Test coverage\n\n");
+  for (int i = 0; i < sc->step_count; ++i)
+  {
+    int done = 0;
+    for (int j = 0; j < nres; ++j)
+    {
+      if (res[j].step == &sc->steps[i])
+      {
+        done = 1;
+        break;
+      }
+    }
+    fprintf(f, "- [%c] %s (%s)\n", done ? 'x' : ' ', sc->steps[i].name ? sc->steps[i].name : "step", done ? "executed" : "skipped");
+  }
+  fprintf(f, "\n");
+
+  fprintf(f, "## Warnings\n\n");
+  if (msgs && msgs->warning_count > 0)
+  {
+    for (int i = 0; i < msgs->warning_count; ++i)
+      fprintf(f, "- %s\n", msgs->warnings[i]);
+  }
+  else
+  {
+    fprintf(f, "- none\n");
+  }
+  fprintf(f, "\n");
 
   fprintf(f, "## Steps\n\n");
   fprintf(f, "| Step | Kind | CPU ops/s | NN inf/s | Mem copy MB/s | Storage MB/s | Net p95 ms | Jitter p99 us |\n");
@@ -1281,13 +1374,18 @@ static void write_report_md(const char *run_dir, const Scenario *sc, const Colle
   fprintf(f, "- Более высокие CPU/NN/MEM/STORAGE показатели — лучше.\n");
   fprintf(f, "- Более низкие latency/jitter/packet loss — лучше.\n");
   fprintf(f, "- Для длительных тестов анализируй деградацию CPU и рост температуры.\n");
+  if (msgs && msgs->warning_count > 0)
+    fprintf(f, "- Обнаружены недоступные каналы телеметрии, см. раздел Warnings.\n");
   fclose(f);
 }
 /* ---------- benchmark orchestration ---------- */
 
 static int run_benchmark(Scenario sc, double duration_scale, int replace_latest)
 {
+  double run_started_at = now_sec();
   g_stop = 0;
+  memset(&g_run_msgs, 0, sizeof(g_run_msgs));
+  detect_telemetry_channel_warnings();
 
   int total_duration = 0;
   for (int i = 0; i < sc.step_count; ++i)
@@ -1308,26 +1406,23 @@ static int run_benchmark(Scenario sc, double duration_scale, int replace_latest)
 
   print_execution_plan(&sc);
 
-  time_t tt = time(NULL);
-  struct tm tm;
-  localtime_r_portable(&tt, &tm);
-
-  char run_dir[PATH_MAX];
-  if (replace_latest)
-    snprintf(run_dir, sizeof(run_dir), "runs_v4_c/%s_latest", sc.name);
-  else
-    snprintf(run_dir, sizeof(run_dir), "runs_v4_c/%s_%04d%02d%02d_%02d%02d%02d",
-             sc.name, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
-
-  if (mkdir_p(run_dir) != 0)
+  RunContext run_ctx;
+  if (coordinator_prepare_run(&sc, replace_latest, &run_ctx) != 0)
   {
-    fprintf(stderr, "failed to create run directory: %s\n", run_dir);
+    fprintf(stderr, "failed to prepare run context\n");
     return 1;
   }
 
-  write_run_status(run_dir, "created", "run directory created");
-  write_scenario_json(run_dir, &sc);
-  write_system_info(run_dir);
+  if (mkdir_p(run_ctx.run_dir) != 0)
+  {
+    fprintf(stderr, "failed to create run directory: %s\n", run_ctx.run_dir);
+    return 1;
+  }
+
+  write_run_status(run_ctx.run_dir, "created", "prepare", "run directory created");
+  coordinator_write_run_id(&run_ctx);
+  write_scenario_json(run_ctx.run_dir, &sc);
+  write_system_info(run_ctx.run_dir);
 
   Collector c;
   memset(&c, 0, sizeof(c));
@@ -1339,14 +1434,14 @@ static int run_benchmark(Scenario sc, double duration_scale, int replace_latest)
     return 1;
   }
   c.sample_sec = sc.sample_sec > 0 ? sc.sample_sec : 1;
-  snprintf(c.out_dir, sizeof(c.out_dir), "%s", run_dir);
+  snprintf(c.out_dir, sizeof(c.out_dir), "%s", run_ctx.run_dir);
   pthread_mutex_init(&c.lock, NULL);
 
   pthread_t th;
   pthread_create(&th, NULL, collector_thread, &c);
-  write_run_status(run_dir, "running", "telemetry started");
+  write_run_status(run_ctx.run_dir, "running", "prepare", "telemetry started");
 
-  NoiseContext *noise = noise_start(sc.noise_mode, 1, run_dir);
+  NoiseContext *noise = noise_start(sc.noise_mode, 1, run_ctx.run_dir);
 
   StepResult results[MAX_STEPS];
   int nres = 0;
@@ -1360,6 +1455,10 @@ static int run_benchmark(Scenario sc, double duration_scale, int replace_latest)
     r.step = st;
 
     fprintf(stdout, "[STEP] %s (%d sec)\n", st->name, st->duration_sec);
+    if (strstr(st->name, "warmup") != NULL)
+      write_run_status(run_ctx.run_dir, "running", "warmup", st->name);
+    else
+      write_run_status(run_ctx.run_dir, "running", "main", st->name);
 
     if (st->kind == WK_IDLE)
     {
@@ -1372,7 +1471,7 @@ static int run_benchmark(Scenario sc, double duration_scale, int replace_latest)
     }
     else if (st->kind == WK_STORAGE)
     {
-      r.throughput_mb_s = run_storage(st, run_dir,
+      r.throughput_mb_s = run_storage(st, run_ctx.run_dir,
                                       &r.storage_iops,
                                       &r.storage_lat_avg_us,
                                       &r.storage_lat_p50_us,
@@ -1392,7 +1491,7 @@ static int run_benchmark(Scenario sc, double duration_scale, int replace_latest)
                &r.ping_avg_ms,
                &r.ping_max_ms,
                &r.ping_errors,
-               run_dir);
+               run_ctx.run_dir);
     }
     else if (st->kind == WK_NN)
     {
@@ -1423,19 +1522,22 @@ static int run_benchmark(Scenario sc, double duration_scale, int replace_latest)
   c.stop = 1;
   pthread_join(th, NULL);
 
+  write_run_status(run_ctx.run_dir, "running", "stop_modules", "stopping background modules");
   write_telemetry_csv(&c);
-  write_cpu_csv(run_dir, results, nres);
-  write_memory_csv(run_dir, results, nres);
-  write_storage_csv(run_dir, results, nres);
-  write_network_csv(run_dir, results, nres);
-  write_jitter_csv(run_dir, results, nres);
-  write_metrics_json(run_dir, &sc, &c, results, nres);
-  write_report_md(run_dir, &sc, &c, results, nres);
+  write_cpu_csv(run_ctx.run_dir, results, nres);
+  write_memory_csv(run_ctx.run_dir, results, nres);
+  write_storage_csv(run_ctx.run_dir, results, nres);
+  write_network_csv(run_ctx.run_dir, results, nres);
+  write_jitter_csv(run_ctx.run_dir, results, nres);
+  write_run_status(run_ctx.run_dir, "running", "metrics", "calculating metrics");
+  write_metrics_json(run_ctx.run_dir, &sc, &c, results, nres);
+  write_run_status(run_ctx.run_dir, "running", "report", "building report");
+  write_report_md(run_ctx.run_dir, &sc, &c, results, nres, &g_run_msgs, &run_ctx, now_sec() - run_started_at);
 
-  write_run_status(run_dir, g_stop ? "interrupted" : "completed", g_stop ? "stopped" : "ok");
+  write_run_status(run_ctx.run_dir, g_stop ? "interrupted" : "completed", "done", g_stop ? "stopped" : "ok");
 
   free(c.rows);
-  fprintf(stdout, "Done. Results: %s\n", run_dir);
+  fprintf(stdout, "Done. Results: %s\n", run_ctx.run_dir);
   return 0;
 }
 
