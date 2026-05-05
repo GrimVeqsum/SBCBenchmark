@@ -35,7 +35,9 @@ int coordinator_write_run_id(const RunContext *ctx)
     return -1;
 
   char p[PATH_MAX];
-  snprintf(p, sizeof(p), "%s/run_id.txt", ctx->run_dir);
+  int n = snprintf(p, sizeof(p), "%s/run_id.txt", ctx->run_dir);
+  if (n < 0 || (size_t)n >= sizeof(p))
+    return -1;
   FILE *f = fopen(p, "w");
   if (!f)
     return -1;

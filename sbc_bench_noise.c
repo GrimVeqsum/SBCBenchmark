@@ -61,7 +61,9 @@ static void *io_noise_worker(void *arg)
 {
   IoNoiseArg *a = (IoNoiseArg *)arg;
   char path[PATH_MAX];
-  snprintf(path, sizeof(path), "%s/noise_io.bin", a->io_dir[0] ? a->io_dir : ".");
+  int pn = snprintf(path, sizeof(path), "%s/noise_io.bin", a->io_dir[0] ? a->io_dir : ".");
+  if (pn < 0 || (size_t)pn >= sizeof(path))
+    snprintf(path, sizeof(path), "%s", "./noise_io.bin");
 
   int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
   if (fd < 0)

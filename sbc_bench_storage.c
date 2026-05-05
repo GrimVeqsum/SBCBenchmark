@@ -9,11 +9,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #ifdef _WIN32
 #include <io.h>
+#include <malloc.h>
 #define fsync _commit
+#define pread(fd, buf, count, offset) (_lseeki64((fd), (offset), SEEK_SET) < 0 ? -1 : read((fd), (buf), (count)))
 #endif
 
 typedef struct
@@ -80,7 +83,12 @@ double storage_run(const Step *s, const char *out_dir,
     block = 8 * 1024 * 1024;
 
   char *buf = NULL;
+#ifdef _WIN32
+  buf = (char *)_aligned_malloc(block, 4096);
+  if (!buf)
+#else
   if (posix_memalign((void **)&buf, 4096, block) != 0 || !buf)
+#endif
   {
     close(fd);
     return -1.0;
@@ -167,7 +175,8 @@ double storage_run(const Step *s, const char *out_dir,
     int mfd = open(md, O_CREAT | O_TRUNC | O_WRONLY, 0644);
     if (mfd >= 0)
     {
-      write(mfd, "x", 1);
+      ssize_t wrc = write(mfd, "x", 1);
+      (void)wrc;
       close(mfd);
     }
     unlink(md);
@@ -185,7 +194,12 @@ double storage_run(const Step *s, const char *out_dir,
     char dpath[PATH_MAX];
     snprintf(dpath, sizeof(dpath), "%s/bench_dir_%d", out_dir, i);
     double a = now_sec_local();
-    int mk = mkdir(dpath, 0755);
+    int mk = mkdir(dpath
+#ifndef _WIN32
+                   ,
+                   0755
+#endif
+    );
     int rm = (mk == 0) ? rmdir(dpath) : -1;
     double b = now_sec_local();
     if (mk == 0 && rm == 0)
@@ -219,7 +233,11 @@ double storage_run(const Step *s, const char *out_dir,
     *iops = (double)ops / elapsed;
 
   s_free(&lat);
+#ifdef _WIN32
+  _aligned_free(buf);
+#else
   free(buf);
+#endif
   close(fd);
   unlink(path);
 

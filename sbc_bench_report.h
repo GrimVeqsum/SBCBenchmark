@@ -10,5 +10,6 @@ void report_write_system_info(const char *run_dir);
 void report_write_metrics_json(const char *run_dir, const Scenario *sc, const Collector *c, const StepResult *res, int nres);
 void report_write_report_md(const char *run_dir, const Scenario *sc, const Collector *c, const StepResult *res, int nres,
                             const RunMessages *msgs, const RunContext *run_ctx, double run_sec);
+void report_write_step_csvs(const char *run_dir, const StepResult *res, int nres);
 
 #endif
