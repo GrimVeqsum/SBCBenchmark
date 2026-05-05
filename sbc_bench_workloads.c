@@ -209,6 +209,26 @@ double workload_run_nn_inference(const Step *s, volatile sig_atomic_t *g_stop)
   return (double)iters / elapsed;
 }
 
+static size_t read_mem_available_bytes_fallback(void)
+{
+  FILE *f = fopen("/proc/meminfo", "r");
+  if (!f)
+    return 64u * 1024u * 1024u; /* safe fallback */
+
+  char line[256];
+  long long mem_avail_kb = -1;
+  while (fgets(line, sizeof(line), f))
+  {
+    if (sscanf(line, "MemAvailable: %lld kB", &mem_avail_kb) == 1)
+      break;
+  }
+  fclose(f);
+
+  if (mem_avail_kb <= 0)
+    return 64u * 1024u * 1024u; /* safe fallback */
+  return (size_t)mem_avail_kb * 1024u;
+}
+
 size_t workload_parse_mem_bytes(const char *arg, int *was_clamped)
 {
   if (was_clamped)
@@ -253,8 +273,47 @@ void workload_run_memory_test(const Step *s,
 {
   (void)g_stop;
   *read_mb_s = *write_mb_s = *copy_mb_s = -1.0;
-  const size_t nbytes = workload_parse_mem_bytes(s->arg, was_clamped);
+  if (was_clamped)
+    *was_clamped = 0;
+
+  const size_t requested = workload_parse_mem_bytes(s->arg, was_clamped);
+  const size_t mem_avail = read_mem_available_bytes_fallback();
+
+  if (mem_avail < (60u * 1024u * 1024u))
+  {
+    if (was_clamped)
+      *was_clamped = 2; /* skipped: too low memory */
+    return;
+  }
+
+  size_t cap_by_ratio = (size_t)((double)mem_avail * 0.15);
+  size_t cap_by_ram = (mem_avail < (160u * 1024u * 1024u))
+                          ? (16u * 1024u * 1024u)
+                          : (32u * 1024u * 1024u);
+
+  size_t safe_limit = cap_by_ratio < cap_by_ram ? cap_by_ratio : cap_by_ram;
+  if (safe_limit < (1u * 1024u * 1024u))
+  {
+    if (was_clamped)
+      *was_clamped = 2; /* skipped: effective safe limit too small */
+    return;
+  }
+
+  size_t nbytes = requested;
+  if (nbytes > safe_limit)
+  {
+    nbytes = safe_limit;
+    if (was_clamped && *was_clamped == 0)
+      *was_clamped = 1; /* clamped */
+  }
+
   const size_t n = nbytes / sizeof(uint64_t);
+  if (n == 0)
+  {
+    if (was_clamped)
+      *was_clamped = 2;
+    return;
+  }
 
   uint64_t *a = NULL;
   uint64_t *b = NULL;
@@ -278,6 +337,8 @@ void workload_run_memory_test(const Step *s,
     free(a);
     free(b);
 #endif
+    if (was_clamped)
+      *was_clamped = 3; /* alloc failure treated as degraded/skip */
     return;
   }
 

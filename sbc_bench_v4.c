@@ -527,11 +527,17 @@ static int run_benchmark(Scenario sc, double duration_scale, int replace_latest)
                        &r.ping_errors,
                        run_ctx.run_dir);
     }
-    else if (st->kind == WK_NN)
+    else if (st->kind == WK_MEMORY)
     {
-      r.nn_inf_per_sec = workload_run_nn_inference(st, &g_stop);
-      if (r.nn_inf_per_sec == -2.0)
-        add_warning("neural: step skipped due to low MemAvailable");
+      int mem_state = 0;
+      workload_run_memory_test(st, &r.mem_read_mb_s, &r.mem_write_mb_s, &r.mem_copy_mb_s, &g_stop, &mem_state);
+
+      if (mem_state == 1)
+        add_warning("Memory buffer clamped due to low available memory");
+      else if (mem_state == 2)
+        add_warning("Memory step skipped: not enough available memory");
+      else if (mem_state == 3)
+        add_warning("Memory step skipped: allocation failed under memory pressure");
     }
     else if (st->kind == WK_MEMORY)
     {
