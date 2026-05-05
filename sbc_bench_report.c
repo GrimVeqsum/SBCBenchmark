@@ -69,6 +69,14 @@ static int join_path_local(char *dst, size_t dst_sz, const char *dir, const char
   return (n < 0 || (size_t)n >= dst_sz) ? -1 : 0;
 }
 
+static void json_num_or_null(FILE *f, const char *key, double v, int comma)
+{
+  if (v < 0.0)
+    fprintf(f, "  \"%s\": null%s\n", key, comma ? "," : "");
+  else
+    fprintf(f, "  \"%s\": %.3f%s\n", key, v, comma ? "," : "");
+}
+
 void report_write_run_status(const char *run_dir, const char *status, const char *stage, const char *message, const RunMessages *msgs)
 {
   char p[PATH_MAX];
@@ -346,96 +354,85 @@ void report_write_metrics_json(const char *run_dir, const Scenario *sc, const Co
     }
   }
 
-  if (c_cpu > 0)
+  if (c_cpu)
     cpu_avg /= c_cpu;
-  if (c_nn > 0)
+  if (c_nn)
     nn_avg /= c_nn;
-  if (c_mem > 0)
+  if (c_mem)
     mem_copy_avg /= c_mem;
-  if (c_st > 0)
+  if (c_st)
     storage_avg /= c_st;
-  if (c_net > 0)
+  if (c_net)
     ping_p95_avg /= c_net;
-  if (c_jit > 0)
+  if (c_jit)
     jitter_p99_avg /= c_jit;
 
-  double stability = -1.0;
-  if (cpu_windows_n > 1)
-    stability = calc_stability_coeff(cpu_windows, cpu_windows_n);
-
-  double perf_per_watt = -1.0;
-  if (cpu_avg > 0.0 && sc->assumed_power_w > 0.0)
-    perf_per_watt = cpu_avg / sc->assumed_power_w;
-
-  StatsSummary network_avg_stats = {0}, network_min_stats = {0}, network_max_stats = {0}, network_loss_stats = {0};
-  StatsSummary storage_p99_stats = {0}, storage_avg_lat_stats = {0}, storage_p95_lat_stats = {0}, storage_p999_stats = {0}, storage_max_stats = {0};
-  StatsSummary jitter_p99_stats = {0}, jitter_avg_stats = {0}, jitter_p95_stats = {0}, jitter_max_stats = {0};
-
-  if (network_avg_n > 0)
-    network_avg_stats = stats_from_array(network_avg_vals, network_avg_n);
-  if (network_min_n > 0)
-    network_min_stats = stats_from_array(network_min_vals, network_min_n);
-  if (network_max_n > 0)
-    network_max_stats = stats_from_array(network_max_vals, network_max_n);
-  if (network_loss_n > 0)
-    network_loss_stats = stats_from_array(network_loss_vals, network_loss_n);
-
-  if (storage_p99_n > 0)
-    storage_p99_stats = stats_from_array(storage_p99_vals, storage_p99_n);
-  if (storage_avg_lat_n > 0)
-    storage_avg_lat_stats = stats_from_array(storage_avg_lat_vals, storage_avg_lat_n);
-  if (storage_p95_lat_n > 0)
-    storage_p95_lat_stats = stats_from_array(storage_p95_lat_vals, storage_p95_lat_n);
-  if (storage_p999_n > 0)
-    storage_p999_stats = stats_from_array(storage_p999_vals, storage_p999_n);
-  if (storage_max_n > 0)
-    storage_max_stats = stats_from_array(storage_max_vals, storage_max_n);
-
-  if (jitter_p99_n > 0)
-    jitter_p99_stats = stats_from_array(jitter_p99_vals, jitter_p99_n);
-  if (jitter_avg_n > 0)
-    jitter_avg_stats = stats_from_array(jitter_avg_vals, jitter_avg_n);
-  if (jitter_p95_n > 0)
-    jitter_p95_stats = stats_from_array(jitter_p95_vals, jitter_p95_n);
-  if (jitter_max_n > 0)
-    jitter_max_stats = stats_from_array(jitter_max_vals, jitter_max_n);
-
-  double cpu_stability = stability < 0.0 ? -1.0 : stability * 100.0;
+  StatsSummary storage_p99_stats = stats_from_array(storage_p99_vals, storage_p99_n);
+  StatsSummary storage_avg_lat_stats = stats_from_array(storage_avg_lat_vals, storage_avg_lat_n);
+  StatsSummary storage_p95_lat_stats = stats_from_array(storage_p95_lat_vals, storage_p95_lat_n);
+  StatsSummary storage_p999_stats = stats_from_array(storage_p999_vals, storage_p999_n);
+  StatsSummary storage_max_stats = stats_from_array(storage_max_vals, storage_max_n);
+  StatsSummary network_avg_stats = stats_from_array(network_avg_vals, network_avg_n);
+  StatsSummary network_min_stats = stats_from_array(network_min_vals, network_min_n);
+  StatsSummary network_max_stats = stats_from_array(network_max_vals, network_max_n);
+  StatsSummary network_loss_stats = stats_from_array(network_loss_vals, network_loss_n);
+  StatsSummary jitter_p99_stats = stats_from_array(jitter_p99_vals, jitter_p99_n);
+  StatsSummary jitter_avg_stats = stats_from_array(jitter_avg_vals, jitter_avg_n);
+  StatsSummary jitter_p95_stats = stats_from_array(jitter_p95_vals, jitter_p95_n);
+  StatsSummary jitter_max_stats = stats_from_array(jitter_max_vals, jitter_max_n);
+  double cpu_stability = calc_stability_coeff(cpu_windows, cpu_windows_n);
 
   fprintf(f, "{\n");
   fprintf(f, "  \"scenario\": \"%s\",\n", sc->name ? sc->name : "unknown");
-  fprintf(f, "  \"cpu_ops_avg\": %.3f,\n", cpu_avg);
-  fprintf(f, "  \"nn_inf_per_sec_avg\": %.3f,\n", nn_avg);
-  fprintf(f, "  \"mem_copy_mb_s_avg\": %.3f,\n", mem_copy_avg);
-  fprintf(f, "  \"storage_mb_s_avg\": %.3f,\n", storage_avg);
-  fprintf(f, "  \"ping_p95_ms_avg\": %.3f,\n", ping_p95_avg);
-  fprintf(f, "  \"jitter_p99_us_avg\": %.3f,\n", jitter_p99_avg);
-  fprintf(f, "  \"stability_score_pct\": %.3f,\n", cpu_stability);
-  fprintf(f, "  \"perf_per_watt\": %.3f,\n", perf_per_watt);
-  fprintf(f, "  \"throttle_hint\": %d,\n", throttle_hint);
-
-  fprintf(f, "  \"storage_lat_avg_us\": %.3f,\n", storage_avg_lat_stats.avg);
-  fprintf(f, "  \"storage_lat_p95_us\": %.3f,\n", storage_p95_lat_stats.avg);
-  fprintf(f, "  \"storage_lat_p99_us\": %.3f,\n", storage_p99_stats.avg);
-  fprintf(f, "  \"storage_lat_p999_us\": %.3f,\n", storage_p999_stats.avg);
-  fprintf(f, "  \"storage_lat_max_us\": %.3f,\n", storage_max_stats.max);
+  fprintf(f, "  \"power_source\": \"assumed\",\n");
+  fprintf(f, "  \"assumed_power_w\": %.3f,\n", sc->assumed_power_w);
+  fprintf(f, "  \"perf_per_watt_note\": \"Оценочное значение\",\n");
+  json_num_or_null(f, "cpu_ops_avg", cpu_avg, 1);
+  json_num_or_null(f, "nn_inf_per_sec_avg", nn_avg, 1);
+  json_num_or_null(f, "mem_copy_mb_s_avg", mem_copy_avg, 1);
+  json_num_or_null(f, "storage_mb_s_avg", storage_avg, 1);
+  json_num_or_null(f, "ping_p95_ms_avg", ping_p95_avg, 1);
+  json_num_or_null(f, "jitter_p99_us_avg", jitter_p99_avg, 1);
+  json_num_or_null(f, "storage_p99_us_median", storage_p99_stats.median, 1);
+  json_num_or_null(f, "storage_p99_us_p95", storage_p99_stats.p95, 1);
+  json_num_or_null(f, "storage_p99_us_max", storage_p99_stats.max, 1);
+  json_num_or_null(f, "storage_lat_avg_us", storage_avg_lat_stats.avg, 1);
+  json_num_or_null(f, "storage_lat_p95_us", storage_p95_lat_stats.avg, 1);
+  json_num_or_null(f, "storage_lat_p999_us", storage_p999_n >= 1000 ? storage_p999_stats.avg : -1.0, 1);
+  json_num_or_null(f, "storage_lat_max_us", storage_max_stats.max, 1);
   fprintf(f, "  \"storage_outliers_total\": %" PRIu64 ",\n", storage_outliers_sum);
-
-  fprintf(f, "  \"network_rtt_min_ms\": %.3f,\n", network_min_stats.avg);
-  fprintf(f, "  \"network_rtt_avg_ms_median\": %.3f,\n", network_avg_stats.median);
-  fprintf(f, "  \"network_rtt_avg_ms_p95\": %.3f,\n", network_avg_stats.p95);
-  fprintf(f, "  \"network_rtt_max_ms\": %.3f,\n", network_max_stats.avg);
-  fprintf(f, "  \"network_loss_pct\": %.3f,\n", network_loss_stats.avg);
+  json_num_or_null(f, "network_rtt_min_ms", network_min_stats.avg, 1);
+  json_num_or_null(f, "network_rtt_avg_ms_median", network_avg_stats.median, 1);
+  json_num_or_null(f, "network_rtt_avg_ms_p95", network_avg_stats.p95, 1);
+  json_num_or_null(f, "network_rtt_max_ms", network_max_stats.avg, 1);
+  json_num_or_null(f, "network_loss_pct", network_loss_stats.avg, 1);
   fprintf(f, "  \"network_errors_total\": %" PRIu64 ",\n", network_errors_sum);
-
-  fprintf(f, "  \"jitter_avg_us\": %.3f,\n", jitter_avg_stats.avg);
-  fprintf(f, "  \"jitter_p95_us\": %.3f,\n", jitter_p95_stats.avg);
-  fprintf(f, "  \"jitter_p99_us_median\": %.3f,\n", jitter_p99_stats.median);
-  fprintf(f, "  \"jitter_max_us\": %.3f,\n", jitter_max_stats.max);
+  json_num_or_null(f, "jitter_avg_us", jitter_avg_stats.avg, 1);
+  json_num_or_null(f, "jitter_p95_us", jitter_p95_stats.avg, 1);
+  json_num_or_null(f, "jitter_p99_us_median", jitter_p99_stats.median, 1);
+  json_num_or_null(f, "jitter_max_us", jitter_max_stats.max, 1);
   fprintf(f, "  \"jitter_over_500us_total\": %" PRIu64 ",\n", jitter_over500_sum);
   fprintf(f, "  \"jitter_over_1000us_total\": %" PRIu64 ",\n", jitter_over1000_sum);
-  fprintf(f, "  \"cpu_stability_score\": %.3f,\n", cpu_stability);
-  fprintf(f, "  \"throttle_hint\": %d\n", throttle_hint);
+  json_num_or_null(f, "cpu_stability_score", cpu_stability, 1);
+  fprintf(f, "  \"throttle_hint\": %d,\n", throttle_hint);
+  fprintf(f, "  \"unavailable_metrics\": [");
+  int first = 1;
+  if (nn_avg < 0)
+  {
+    fprintf(f, "%s\"nn_inf_per_sec_avg\"", first ? "" : ",");
+    first = 0;
+  }
+  if (cpu_stability < 0)
+  {
+    fprintf(f, "%s\"cpu_stability_score\"", first ? "" : ",");
+    first = 0;
+  }
+  if (storage_p999_n < 1000)
+  {
+    fprintf(f, "%s\"storage_lat_p999_us\"", first ? "" : ",");
+    first = 0;
+  }
+  fprintf(f, "]\n");
   fprintf(f, "}\n");
   fclose(f);
 
@@ -471,6 +468,8 @@ void report_write_report_md(const char *run_dir, const Scenario *sc, const Colle
     fprintf(f, "- Run date (epoch): %lld\n", (long long)run_ctx->created_at);
   }
   fprintf(f, "- Duration (sec): %.3f\n", run_sec);
+  if (run_sec < 60.0)
+    fprintf(f, "- Warning: запуск выполнен в сокращённом режиме и подходит для smoke-проверки, а не для финальных выводов.\n");
   fprintf(f, "- Samples: %zu\n", c->nrows);
   fprintf(f, "- Tests executed: %d of %d\n\n", nres, sc->step_count);
 

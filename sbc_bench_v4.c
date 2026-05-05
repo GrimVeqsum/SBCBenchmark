@@ -530,6 +530,8 @@ static int run_benchmark(Scenario sc, double duration_scale, int replace_latest)
     else if (st->kind == WK_NN)
     {
       r.nn_inf_per_sec = workload_run_nn_inference(st, &g_stop);
+      if (r.nn_inf_per_sec == -2.0)
+        add_warning("neural: step skipped due to low MemAvailable");
     }
     else if (st->kind == WK_MEMORY)
     {
@@ -642,8 +644,17 @@ static void analyze_latest_run(void)
   char metrics_path[PATH_MAX];
   if (join_path(metrics_path, sizeof(metrics_path), latest, "metrics.json") != 0)
     return;
+  char report_path[PATH_MAX];
+  if (join_path(report_path, sizeof(report_path), latest, "report.md") != 0)
+    return;
 
   fprintf(stdout, "\n=== Latest run: %s ===\n", latest);
+  if (access(report_path, R_OK) == 0)
+  {
+    fprintf(stdout, "\n--- Human-readable report ---\n");
+    print_file_text(report_path);
+  }
+  fprintf(stdout, "\n--- Raw metrics.json ---\n");
   print_file_text(metrics_path);
   fprintf(stdout, "\n");
 }
@@ -690,12 +701,17 @@ int main(int argc, char **argv)
       {
         const char *all[] = {"baseline", "long_soak", "server_gateway", "iot", "embedded", "neural_host"};
         int n = (int)(sizeof(all) / sizeof(all[0]));
+        int failed = 0;
         for (int i = 0; i < n; ++i)
         {
           Scenario sc = scenario_from_name(all[i]);
           int rc = run_benchmark(sc, scale, replace_latest);
           if (rc != 0)
-            return rc;
+          {
+            fprintf(stdout, "[WARN] Scenario '%s' failed with code %d, continue.\n", all[i], rc);
+            failed++;
+            continue;
+          }
           if (g_stop)
           {
             fprintf(stdout, "[INFO] Текущий тест прерван, возврат в меню.\n");
@@ -703,6 +719,8 @@ int main(int argc, char **argv)
             break;
           }
         }
+        if (failed > 0)
+          fprintf(stdout, "[INFO] Run-all finished with %d failed scenario(s).\n", failed);
         continue;
       }
 
