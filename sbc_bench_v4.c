@@ -694,16 +694,28 @@ int main(int argc, char **argv)
         {
           Scenario sc = scenario_from_name(all[i]);
           int rc = run_benchmark(sc, scale, replace_latest);
-          if (rc != 0 || g_stop)
+          if (rc != 0)
             return rc;
+          if (g_stop)
+          {
+            fprintf(stdout, "[INFO] Текущий тест прерван, возврат в меню.\n");
+            g_stop = 0;
+            break;
+          }
         }
         continue;
       }
 
       Scenario sc = use_custom ? build_custom_scenario_from_prompt() : scenario_from_name(chosen);
       int rc = run_benchmark(sc, scale, replace_latest);
-      if (rc != 0 || g_stop)
+      if (rc != 0)
         return rc;
+      if (g_stop)
+      {
+        fprintf(stdout, "[INFO] Текущий тест прерван, возврат в меню.\n");
+        g_stop = 0;
+        continue;
+      }
     }
   }
 
