@@ -440,6 +440,57 @@ void report_write_metrics_json(const char *run_dir, const Scenario *sc, const Co
   s_free(&temp);
 }
 
+static double local_cpu_stability_score(const StepResult *res, int nres)
+{
+  for (int i = 0; i < nres; ++i)
+    if (res[i].step->kind == WK_CPU_BURN && res[i].ops_window_start > 0.0)
+      return res[i].ops_window_end / res[i].ops_window_start;
+  return -1.0;
+}
+
+static void local_temp_freq_stats(const Collector *c, double *tmax, double *favg, double *fmin)
+{
+  *tmax = -1.0;
+  *favg = -1.0;
+  *fmin = -1.0;
+  if (!c || !c->rows || c->nrows == 0)
+    return;
+  double fsum = 0.0;
+  size_t fn = 0;
+  for (size_t i = 0; i < c->nrows; ++i)
+  {
+    if (c->rows[i].temp_c >= 0.0 && c->rows[i].temp_c > *tmax)
+      *tmax = c->rows[i].temp_c;
+    if (c->rows[i].cpu_freq_mhz > 0.0)
+    {
+      if (*fmin < 0.0 || c->rows[i].cpu_freq_mhz < *fmin)
+        *fmin = c->rows[i].cpu_freq_mhz;
+      fsum += c->rows[i].cpu_freq_mhz;
+      fn++;
+    }
+  }
+  if (fn > 0)
+    *favg = fsum / (double)fn;
+}
+
+static int has_warning_substr(const RunMessages *msgs, const char *needle)
+{
+  if (!msgs || !needle || !*needle)
+    return 0;
+  for (int i = 0; i < msgs->warning_count; ++i)
+    if (strstr(msgs->warnings[i], needle))
+      return 1;
+  return 0;
+}
+
+static void md_num_or_na(FILE *f, int applicable, double v)
+{
+  if (!applicable || v < 0.0)
+    fprintf(f, "N/A");
+  else
+    fprintf(f, "%.3f", v);
+}
+
 void report_write_report_md(const char *run_dir, const Scenario *sc, const Collector *c, const StepResult *res, int nres,
                             const RunMessages *msgs, const RunContext *run_ctx, double run_sec)
 {
@@ -524,64 +575,150 @@ void report_write_report_md(const char *run_dir, const Scenario *sc, const Colle
   fprintf(f, "|---|---|---:|---:|---:|---:|---:|---:|\n");
   for (int i = 0; i < nres; ++i)
   {
-    fprintf(f, "| %s | %s | %.3f | %.3f | %.3f | %.3f | %.3f | %.3f |\n",
-            res[i].step->name,
-            kind_name_local(res[i].step->kind),
-            res[i].ops_per_sec,
-            res[i].nn_inf_per_sec,
-            res[i].mem_copy_mb_s,
-            res[i].throughput_mb_s,
-            res[i].ping_p95_ms,
-            res[i].jitter_p99_us);
+    WorkKind k = res[i].step->kind;
+    fprintf(f, "| %s | %s | ", res[i].step->name, kind_name_local(k));
+    md_num_or_na(f, k == WK_CPU_BURN, res[i].ops_per_sec);
+    fprintf(f, " | ");
+    md_num_or_na(f, k == WK_NN, res[i].nn_inf_per_sec);
+    fprintf(f, " | ");
+    md_num_or_na(f, k == WK_MEMORY, res[i].mem_copy_mb_s);
+    fprintf(f, " | ");
+    md_num_or_na(f, k == WK_STORAGE, res[i].throughput_mb_s);
+    fprintf(f, " | ");
+    md_num_or_na(f, k == WK_PING, res[i].ping_p95_ms);
+    fprintf(f, " | ");
+    md_num_or_na(f, k == WK_JITTER, res[i].jitter_p99_us);
+    fprintf(f, " |\n");
   }
+
+  int skipped = sc->step_count - nres;
+  int has_telemetry_unavail = warn_thermal || warn_freq || warn_psi;
+  int warn_mem_clamp = has_warning_substr(msgs, "Memory buffer clamped due to low available memory");
+  int warn_mem_skip = has_warning_substr(msgs, "Memory step skipped due to low available memory");
+
+  const StepResult *cpu = NULL, *stg = NULL, *net = NULL, *jit = NULL;
+  for (int i = 0; i < nres; ++i)
+  {
+    if (!cpu && res[i].step->kind == WK_CPU_BURN)
+      cpu = &res[i];
+    if (!stg && res[i].step->kind == WK_STORAGE)
+      stg = &res[i];
+    if (!net && res[i].step->kind == WK_PING)
+      net = &res[i];
+    if (!jit && res[i].step->kind == WK_JITTER)
+      jit = &res[i];
+  }
+
+  double cpu_stability = local_cpu_stability_score(res, nres);
+  double tmax, favg, fmin;
+  local_temp_freq_stats(c, &tmax, &favg, &fmin);
+  double throttle_hint = (tmax >= 0.0 && favg > 0.0 && fmin > 0.0 && (favg - fmin) / favg > 0.15) ? 1.0 : 0.0;
+
+  const char *result = (msgs && msgs->error_count > 0) ? "FAIL" : "OK";
+  if (strcmp(result, "OK") == 0 && ((stg && stg->storage_lat_p99_us > 100000.0) || (jit && jit->jitter_p99_us > 1000.0) || (net && net->packet_loss_pct > 0.0) || warn_mem_clamp))
+    result = "WARN";
 
   fprintf(f, "\n## Interpretation\n\n");
-  fprintf(f, "- Более высокие CPU/NN/MEM/STORAGE показатели — лучше.\n");
-  fprintf(f, "- Более низкие latency/jitter/packet loss — лучше.\n");
-  fprintf(f, "- Для длительных тестов анализируй деградацию CPU и рост температуры.\n");
-  if (msgs && msgs->warning_count > 0)
-    fprintf(f, "- Обнаружены недоступные каналы телеметрии, см. раздел Warnings.\n");
+  fprintf(f, "- Сценарий %s: выполнено %d из %d шагов, пропущено %d. Длительность запуска %.1f с. Статус: **%s**.\n",
+          (skipped == 0 ? "выполнен полностью" : "выполнен частично"), nres, sc->step_count, skipped, run_sec, result);
+  if (run_ctx && run_ctx->duration_scale > 0.0 && run_ctx->duration_scale < 0.5)
+    fprintf(f, "- Запуск выполнен в сокращённом проверочном режиме (duration scale = %.2f).\n", run_ctx->duration_scale);
 
-  int has_cpu_degradation = 0;
-  int has_storage_tail = 0;
-  int has_network_instability = 0;
-  int has_high_jitter = 0;
-  for (int i = 0; i < nres; ++i)
-  {
-    if (res[i].step->kind == WK_CPU_BURN && res[i].cpu_degradation_pct > 10.0)
-      has_cpu_degradation = 1;
-    if (res[i].step->kind == WK_STORAGE && res[i].storage_lat_p99_us > 50000.0)
-      has_storage_tail = 1;
-    if (res[i].step->kind == WK_PING && (res[i].packet_loss_pct > 3.0 || res[i].ping_p95_ms > 100.0))
-      has_network_instability = 1;
-    if (res[i].step->kind == WK_JITTER && res[i].jitter_p99_us > 1000.0)
-      has_high_jitter = 1;
-  }
-  if (has_cpu_degradation)
-    fprintf(f, "- Обнаружено снижение CPU производительности (>10%% по окнам).\n");
-  if (has_storage_tail)
-    fprintf(f, "- Обнаружены выраженные хвостовые задержки накопителя (p99 latency).\n");
-  if (has_network_instability)
-    fprintf(f, "- Обнаружена нестабильность сети (loss/p95 RTT выше эвристического порога).\n");
-  if (has_high_jitter)
-    fprintf(f, "- Обнаружен повышенный джиттер таймера (p99 > 1000 мкс).\n");
+  if (warn_mem_clamp)
+    fprintf(f, "- Буфер проверки памяти был уменьшен из-за малого объёма доступной оперативной памяти. Это штатное защитное поведение, которое предотвращает аварийное завершение процесса ядром Linux.\n");
+  if (warn_mem_skip)
+    fprintf(f, "- Проверка памяти была пропущена из-за недостаточного объёма доступной оперативной памяти.\n");
 
-  const char *verdict = "OK";
-  for (int i = 0; i < nres; ++i)
+  if (cpu)
   {
-    if (res[i].step->kind == WK_JITTER && res[i].jitter_p99_us > 1000.0)
-      verdict = "WARN";
-    if (res[i].step->kind == WK_PING && res[i].packet_loss_pct > 3.0)
-      verdict = "WARN";
-    if (res[i].step->kind == WK_STORAGE && res[i].storage_lat_p99_us > 50000.0)
-      verdict = "WARN";
+    fprintf(f, "- CPU: средняя производительность %.3f ops/s. ", cpu->ops_per_sec);
+    if (cpu_stability >= 0.95)
+      fprintf(f, "По коэффициенту устойчивости %.3f заметной деградации CPU не обнаружено. ", cpu_stability);
+    else if (cpu_stability >= 0.80)
+      fprintf(f, "По коэффициенту устойчивости %.3f есть умеренное снижение производительности. ", cpu_stability);
+    else
+      fprintf(f, "По коэффициенту устойчивости %.3f обнаружена выраженная деградация CPU. ", cpu_stability);
+    fprintf(f, "%s\n", (throttle_hint >= 0.5) ? "Есть признаки снижения частоты при росте температуры, возможно тепловое ограничение." : "Признаков выраженного теплового ограничения по частоте не обнаружено.");
   }
+  if (tmax >= 0.0 || favg >= 0.0 || fmin >= 0.0)
+  {
+    fprintf(f, "- Телеметрия: ");
+    if (tmax >= 0.0)
+      fprintf(f, "максимальная температура %.1f °C; ", tmax);
+    if (favg >= 0.0)
+      fprintf(f, "средняя частота CPU %.1f MHz; ", favg);
+    if (fmin >= 0.0)
+      fprintf(f, "минимальная частота CPU %.1f MHz. ", fmin);
+    fprintf(f, "Связь с throttle_hint: %s\n", (throttle_hint >= 0.5) ? "наблюдаются признаки троттлинга." : "признаков троттлинга не видно.");
+  }
+  if (stg)
+  {
+    fprintf(f, "- Накопитель: p99 задержки %.0f us (≈ %.1f ms). 99-й процентиль задержки накопителя означает, что 99%% операций завершились не медленнее указанного времени, а оставшийся 1%% мог выполняться дольше. ", stg->storage_lat_p99_us, stg->storage_lat_p99_us / 1000.0);
+    if (stg->storage_lat_max_us >= 0.0)
+      fprintf(f, "Максимум %.0f us (≈ %.1f ms). ", stg->storage_lat_max_us, stg->storage_lat_max_us / 1000.0);
+    fprintf(f, "Выбросов: %" PRIu64 ". ", stg->storage_outliers);
+    if (stg->storage_lat_p99_us < 10000.0)
+      fprintf(f, "Хвостовые задержки накопителя невысокие.\n");
+    else if (stg->storage_lat_p99_us <= 100000.0)
+      fprintf(f, "Есть заметные хвостовые задержки.\n");
+    else
+      fprintf(f, "Обнаружены выраженные хвостовые задержки, потенциально критичные для синхронной записи и журналирования.\n");
+  }
+  if (net)
+  {
+    fprintf(f, "- Сеть: avg RTT %.3f ms, p95 RTT %.3f ms, max RTT %.3f ms; потери %.3f%%; ошибки %" PRIu64 ". ", net->ping_avg_ms, net->ping_p95_ms, net->ping_max_ms, net->packet_loss_pct, net->ping_errors);
+    if (net->packet_loss_pct == 0.0 && net->ping_errors == 0)
+      fprintf(f, "Сетевой отклик в данном прогоне был стабильным. ");
+    else
+      fprintf(f, "Сетевая часть показала нестабильность. ");
+    if (net->ping_max_ms > net->ping_p95_ms * 2.0)
+      fprintf(f, "Максимальный RTT заметно выше p95/avg, присутствуют выбросы.\n");
+    else
+      fprintf(f, "\n");
+  }
+  if (jit)
+  {
+    fprintf(f, "- Джиттер: p99 %.0f us (≈ %.1f ms), max %.0f us (≈ %.1f ms), over_500us=%" PRIu64 ", over_1000us=%" PRIu64 ". ", jit->jitter_p99_us, jit->jitter_p99_us / 1000.0, jit->jitter_max_us, jit->jitter_max_us / 1000.0, jit->jitter_over_500us, jit->jitter_over_1000us);
+    if (jit->jitter_p99_us < 500.0 && jit->jitter_over_500us == 0)
+      fprintf(f, "Таймер достаточно стабилен для задач мягкого реального времени.\n");
+    else if (jit->jitter_p99_us <= 1000.0)
+      fprintf(f, "Есть умеренная неравномерность таймера.\n");
+    else
+    {
+      fprintf(f, "Обнаружен повышенный джиттер, плата ограниченно пригодна для задач с требованием стабильных временных интервалов. ");
+      if (jit->jitter_p99_us > 1000000.0)
+        fprintf(f, "Значение превышает 1 секунду, это крайне высокий джиттер для управляющих задач.");
+      fprintf(f, "\n");
+    }
+  }
+
+  if (has_telemetry_unavail)
+    fprintf(f, "- Обнаружены недоступные каналы телеметрии: thermal=%s, cpu frequency=%s, PSI=%s.\n", warn_thermal ? "problem" : "ok", warn_freq ? "problem" : "ok", warn_psi ? "problem" : "ok");
+
+  fprintf(f, "- Итог: плата подходит для общих вычислительных и сетевых задач при текущей нагрузке. Ограничения определяются хвостовыми задержками накопителя и/или джиттером таймера, если они превышают пороги сценария.\n");
+
   fprintf(f, "\n## Verdict\n\n");
-  fprintf(f, "- Result: **%s**\n", verdict);
-  if (strcmp(verdict, "WARN") == 0)
-    fprintf(f, "- Причина: одна или несколько tail-метрик вышли за эвристический порог.\n");
+  fprintf(f, "- Result: **%s**\n", result);
+  if (strcmp(result, "FAIL") == 0)
+  {
+    fprintf(f, "- Причины (ошибки):\n");
+    for (int i = 0; msgs && i < msgs->error_count; ++i)
+      fprintf(f, "  - %s\n", msgs->errors[i]);
+  }
+  else if (strcmp(result, "WARN") == 0)
+  {
+    fprintf(f, "- Причины:\n");
+    if (stg && stg->storage_lat_p99_us > 100000.0)
+      fprintf(f, "  - p99 задержки накопителя превышает 100 мс.\n");
+    if (jit && jit->jitter_p99_us > 1000.0)
+      fprintf(f, "  - p99 джиттера превышает 1000 мкс.\n");
+    if (warn_mem_clamp)
+      fprintf(f, "  - буфер проверки памяти был уменьшен из-за малого объёма ОЗУ.\n");
+    if (net && (net->packet_loss_pct > 0.0 || net->ping_errors > 0))
+      fprintf(f, "  - есть потери пакетов или сетевые ошибки.\n");
+  }
   else
-    fprintf(f, "- Основные хвостовые метрики в допустимом эвристическом диапазоне.\n");
+    fprintf(f, "- Критических превышений исследовательских порогов не обнаружено.\n");
 
   fclose(f);
 }

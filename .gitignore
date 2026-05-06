@@ -11,6 +11,7 @@ sbcbench
 
 # Local test binaries
 test.bin
+metrics_smoke
 
 # Runtime outputs
 results/

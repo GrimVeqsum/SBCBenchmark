@@ -441,6 +441,7 @@ static int run_benchmark(Scenario sc, double duration_scale, int replace_latest)
   print_execution_plan(&sc);
 
   RunContext run_ctx;
+  run_ctx.duration_scale = duration_scale;
   if (coordinator_prepare_run(&sc, replace_latest, &run_ctx) != 0)
   {
     fprintf(stderr, "failed to prepare run context\n");

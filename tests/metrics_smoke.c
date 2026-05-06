@@ -1,54 +1,45 @@
+#include "../sbc_bench_v4.h"
+#include <assert.h>
 #include <math.h>
 #include <stdio.h>
-#include <stdlib.h>
-
-#include "../sbc_bench_metrics.h"
-
-static int approx(double a, double b, double eps)
-{
-  return fabs(a - b) <= eps;
-}
 
 int main(void)
 {
-  double a[] = {1, 2, 3, 4, 5};
-  StatsSummary s = stats_from_array(a, 5);
-  if (!approx(s.avg, 3.0, 1e-9))
-    return 1;
-  if (!approx(s.median, 3.0, 1e-9))
-    return 2;
-  if (!approx(s.p95, 4.8, 1e-9))
-    return 3;
-  if (!approx(s.max, 5.0, 1e-9))
-    return 4;
+  double arr[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+  Stats s = stats_from_array(arr, 10);
+  assert(fabs(s.avg - 5.5) < 1e-9);
+  assert(fabs(s.median - 5.5) < 1e-9);
+  assert(s.p95 >= 9.0 && s.p95 <= 10.0);
+  assert(s.max == 10.0);
 
-  double d = calc_degradation_percent(100.0, 80.0);
-  if (!approx(d, 20.0, 1e-9))
-    return 5;
+  double empty_arr[] = {0};
+  Stats e = stats_from_array(empty_arr, 0);
+  assert(e.avg < 0.0 && e.median < 0.0 && e.p95 < 0.0 && e.p99 < 0.0 && e.p999 < 0.0);
 
-  double f[] = {2000, 1900, 1700};
-  double t[] = {50, 58, 63};
-  if (detect_freq_drop_with_temp_rise(f, t, 3, 10.0, 5.0) != 1)
-    return 6;
+  double sample[] = {100.0, 98.0, 95.0, 90.0, 85.0};
+  double degr = calc_degradation_percent(sample, 5);
+  assert(degr > 10.0 && degr < 20.0);
 
-  double stable_series[] = {100, 98, 97, 96, 95, 94};
-  double st = calc_stability_coeff(stable_series, sizeof(stable_series) / sizeof(stable_series[0]));
-  if (!approx(st, 0.95, 1e-9))
-    return 7;
+  double stable[] = {100, 101, 99, 100, 100};
+  double unstable[] = {100, 120, 80, 140, 60};
+  double cs = calc_stability_coeff(stable, 5);
+  double cu = calc_stability_coeff(unstable, 5);
+  assert(cs > cu);
 
-  double no_drop = calc_degradation_percent(80.0, 90.0);
-  if (!approx(no_drop, 0.0, 1e-9))
-    return 8;
+  double temp[] = {50, 52, 55, 60, 65};
+  double freq[] = {1500, 1480, 1450, 1400, 1300};
+  int hint = detect_freq_drop_with_temp_rise(freq, temp, 5);
+  assert(hint == 1);
 
-  double *big = (double *)calloc(1000, sizeof(double));
-  if (!big)
-    return 9;
-  for (int i = 0; i < 1000; ++i)
-    big[i] = (double)(i + 1);
-  StatsSummary sb = stats_from_array(big, 1000);
-  free(big);
-  if (!(sb.p999 > 998.0 && sb.p999 <= 1000.0))
-    return 10;
+  double nohint_temp[] = {60, 58, 57, 56, 55};
+  double nohint_freq[] = {1300, 1350, 1380, 1400, 1420};
+  assert(detect_freq_drop_with_temp_rise(nohint_freq, nohint_temp, 5) == 0);
+
+  double big[2000];
+  for (int i = 0; i < 2000; ++i)
+    big[i] = (double)i;
+  Stats b = stats_from_array(big, 2000);
+  assert(b.p999 >= 1997.0 && b.p999 <= 1999.0);
 
   printf("metrics_smoke: OK\n");
   return 0;
