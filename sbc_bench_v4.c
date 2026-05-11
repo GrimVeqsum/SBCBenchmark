@@ -706,7 +706,7 @@ int main(int argc, char **argv)
 
       if (strcmp(chosen, "__all__") == 0)
       {
-        const char *all[] = {"baseline", "long_soak", "server_gateway", "iot", "embedded", "neural_host"};
+        const char *all[] = {"baseline", "long_soak", "server_gateway", "iot", "embedded"};
         int n = (int)(sizeof(all) / sizeof(all[0]));
         int failed = 0;
         for (int i = 0; i < n; ++i)

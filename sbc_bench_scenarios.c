@@ -10,7 +10,6 @@ static const ScenarioEntry g_scenario_entries[] = {
     {"server_gateway", "Сценарий периферийного сервера", "Смешанная CPU/IO/NET нагрузка"},
     {"iot", "Сценарий контроллера IoT", "Короткие bursts, uplink, low-power профиль"},
     {"embedded", "Встраиваемый сценарий", "Контрольный цикл с требованием стабильности"},
-    {"neural_host", "Нейросетевой сценарий", "Лёгкая матричная/векторная нагрузка"},
     {"manual", "Ручной выбор тестов", "Выбор отдельных тестов пользователем"},
 };
 
@@ -62,7 +61,7 @@ void print_scenario_help(const char *prog)
   fprintf(stderr, "Usage: %s [scenario] [duration_scale]\n", prog);
   fprintf(stderr, "       %s --menu\n", prog);
   fprintf(stderr, "       %s --list-scenarios\n", prog);
-  fprintf(stderr, "Scenarios: baseline, long_soak, server_gateway, iot, embedded, neural_host, manual\n");
+  fprintf(stderr, "Scenarios: baseline, long_soak, server_gateway, iot, embedded, manual\n");
 }
 
 void print_scenario_catalog(void)
@@ -246,22 +245,6 @@ Scenario scenario_from_name(const char *name)
     s.step_count = 4;
     set_primary_metrics(&s, metrics, 5);
   }
-  else if (strcmp(name, "neural_host") == 0 || strcmp(name, "neural") == 0)
-  {
-    const char *metrics[] = {"nn_inf_per_sec_avg", "perf_per_watt", "temp_c_max", "cpu_freq_mhz_avg", "mem_copy_mb_s_avg"};
-    s.name = "neural_host";
-    s.description = "Нейросетевой сценарий (лёгкая матричная нагрузка)";
-    s.critical_temp_c = 90.0;
-    s.target_ping_p99_ms = 40.0;
-    s.noise_mode = NOISE_CPU;
-
-    s.steps[0] = make_step("nn_warmup", WK_NN, 90, 2, "32", "burst", "Прогрев");
-    s.steps[1] = make_step("nn_steady", WK_NN, 240, 2, "48", "steady", "Стабильный инференс");
-    s.steps[2] = make_step("mem_support", WK_MEMORY, 60, 1, "128M", "steady", "Memory поддержка");
-    s.steps[3] = make_step("storage_checkpoint", WK_STORAGE, 60, 1, "4M", "burst", "Checkpoint storage");
-    s.step_count = 4;
-    set_primary_metrics(&s, metrics, 5);
-  }
   else if (strcmp(name, "manual") == 0)
   {
     return build_custom_scenario_from_prompt();
@@ -295,8 +278,7 @@ static void print_console_header(void)
   fprintf(stdout, "3) Периферийный сервер\n");
   fprintf(stdout, "4) Контроллер IoT\n");
   fprintf(stdout, "5) Встраиваемый сценарий\n");
-  fprintf(stdout, "6) Нейросетевой сценарий\n");
-  fprintf(stdout, "7) Ручной выбор тестов\n");
+  fprintf(stdout, "6) Ручной выбор тестов\n");
   fprintf(stdout, "------------------------------------------------------------\n");
 }
 
@@ -359,14 +341,14 @@ int show_interactive_menu(char out_scenario[64], double *out_scale, int *use_cus
     }
 
     int choice = atoi(line);
-    if (choice < 1 || choice > 7)
+    if (choice < 1 || choice > 6)
     {
       fprintf(stdout, "Unknown option: %s\n", line);
       continue;
     }
 
     snprintf(out_scenario, 64, "%s", g_scenario_entries[choice - 1].key);
-    *use_custom = (choice == 7);
+    *use_custom = (choice == 6);
 
     fprintf(stdout, "\nSelected: %s\n%s\n", g_scenario_entries[choice - 1].title, g_scenario_entries[choice - 1].description);
     fprintf(stdout, "Duration scale (Enter = 1.0): ");
@@ -413,7 +395,5 @@ int is_valid_scenario_name(const char *scenario_name)
          strcmp(scenario_name, "iot") == 0 ||
          strcmp(scenario_name, "iot_controller") == 0 ||
          strcmp(scenario_name, "embedded") == 0 ||
-         strcmp(scenario_name, "neural_host") == 0 ||
-         strcmp(scenario_name, "neural") == 0 ||
          strcmp(scenario_name, "manual") == 0;
 }
