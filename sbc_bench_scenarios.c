@@ -301,8 +301,9 @@ int show_interactive_menu(char out_scenario[64], double *out_scale, int *use_cus
     fprintf(stdout, "8) Показать описание сценариев\n");
     fprintf(stdout, "9) Запустить все сценарии\n");
     fprintf(stdout, "a) Анализ последнего прогона\n");
+    fprintf(stdout, "b) Сравнить последние прогоны сценариев\n");
     fprintf(stdout, "q) Выход\n\n");
-    fprintf(stdout, "Select option (1-9, a, q): ");
+    fprintf(stdout, "Select option (1-9, a, b, q): ");
 
     if (read_line_stdin(line, sizeof(line)) != 0)
       return -1;
@@ -337,6 +338,14 @@ int show_interactive_menu(char out_scenario[64], double *out_scale, int *use_cus
       *replace_latest = 0;
       *out_scale = 1.0;
       snprintf(out_scenario, 64, "__analyze__");
+      return 1;
+    }
+    if (strcmp(line, "b") == 0 || strcmp(line, "B") == 0)
+    {
+      *use_custom = 0;
+      *replace_latest = 0;
+      *out_scale = 1.0;
+      snprintf(out_scenario, 64, "__compare_latest__");
       return 1;
     }
 

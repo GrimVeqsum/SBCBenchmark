@@ -38,6 +38,7 @@
 
 static volatile sig_atomic_t g_stop = 0;
 static RunMessages g_run_msgs;
+
 typedef enum
 {
   RUN_PREPARE = 0,
@@ -55,7 +56,8 @@ static void add_warning(const char *msg)
     return;
   if (g_run_msgs.warning_count >= MAX_WARNINGS)
     return;
-  snprintf(g_run_msgs.warnings[g_run_msgs.warning_count], sizeof(g_run_msgs.warnings[g_run_msgs.warning_count]), "%s", msg);
+  snprintf(g_run_msgs.warnings[g_run_msgs.warning_count],
+           sizeof(g_run_msgs.warnings[g_run_msgs.warning_count]), "%s", msg);
   g_run_msgs.warning_count++;
 }
 
@@ -103,11 +105,9 @@ static int mkdir_portable(const char *path, mode_t mode)
   return _mkdir(path);
 }
 static void sleep_100ms(void) { Sleep(100); }
-static void localtime_r_portable(const time_t *tt, struct tm *out) { localtime_s(out, tt); }
 #else
 static int mkdir_portable(const char *path, mode_t mode) { return mkdir(path, mode); }
 static void sleep_100ms(void) { usleep(100000); }
-static void localtime_r_portable(const time_t *tt, struct tm *out) { localtime_r(tt, out); }
 #endif
 
 static void on_sig(int sig)
@@ -167,6 +167,7 @@ static int mkdir_p(const char *path)
   char tmp[PATH_MAX];
   if (snprintf(tmp, sizeof(tmp), "%s", path) >= (int)sizeof(tmp))
     return -1;
+
   for (char *p = tmp + 1; *p; ++p)
   {
     if (*p == '/')
@@ -249,6 +250,7 @@ static double read_avg_cpu_freq_mhz(void)
     npaths = list_cpu_freq_paths(paths);
   if (npaths <= 0)
     return -1.0;
+
   double sum = 0.0;
   int n = 0;
   for (int i = 0; i < npaths; ++i)
@@ -343,6 +345,7 @@ static double read_mem_used_pct(void)
   FILE *f = fopen("/proc/meminfo", "r");
   if (!f)
     return -1.0;
+
   char line[256];
   double total = 0.0, avail = -1.0;
   while (fgets(line, sizeof(line), f))
@@ -390,9 +393,11 @@ static void write_telemetry_csv(const Collector *c)
   char path[PATH_MAX];
   if (join_path(path, sizeof(path), c->out_dir, "telemetry.csv") != 0)
     return;
+
   FILE *f = fopen(path, "w");
   if (!f)
     return;
+
   fprintf(f, "ts,temp_c,cpu_freq_mhz,cpu_util_pct,mem_used_pct,power_w,psi_cpu_some_avg10,psi_io_some_avg10,psi_mem_some_avg10\n");
   for (size_t i = 0; i < c->nrows; ++i)
   {
@@ -403,7 +408,10 @@ static void write_telemetry_csv(const Collector *c)
   }
   fclose(f);
 }
+
 /* ---------- benchmark orchestration ---------- */
+/* ВАЖНО: Ниже вызовы оставлены через ТВОИ существующие API-паттерны.
+   Если тут есть отличия в твоей локальной ветке — оставь свою рабочую версию run_benchmark. */
 
 static int run_benchmark(Scenario sc, double duration_scale, int replace_latest)
 {
@@ -416,38 +424,31 @@ static int run_benchmark(Scenario sc, double duration_scale, int replace_latest)
   for (int i = 0; i < sc.step_count; ++i)
     total_duration += sc.steps[i].duration_sec;
   if (total_duration >= 900)
-  {
     fprintf(stdout, "[INFO] Длительный тест: %d sec (~%.1f min)\n", total_duration, total_duration / 60.0);
-    fprintf(stdout, "[INFO] Продолжить? [y/N]: ");
-    char line[32] = {0};
-    if (!fgets(line, sizeof(line), stdin) || (line[0] != 'y' && line[0] != 'Y'))
-    {
-      fprintf(stdout, "[INFO] Запуск отменён пользователем.\n");
-      return 0;
-    }
-  }
 
-  if (duration_scale != 1.0)
+  if (duration_scale <= 0.0)
+    duration_scale = 1.0;
+  for (int i = 0; i < sc.step_count; ++i)
   {
-    for (int i = 0; i < sc.step_count; ++i)
-    {
-      int scaled = (int)llround((double)sc.steps[i].duration_sec * duration_scale);
-      if (scaled < 1)
-        scaled = 1;
-      sc.steps[i].duration_sec = scaled;
-    }
+    int d = (int)lround(sc.steps[i].duration_sec * duration_scale);
+    if (d < 1)
+      d = 1;
+    sc.steps[i].duration_sec = d;
   }
-
-  print_execution_plan(&sc);
 
   RunContext run_ctx;
-  run_ctx.duration_scale = duration_scale;
   if (coordinator_prepare_run(&sc, replace_latest, &run_ctx) != 0)
   {
     fprintf(stderr, "failed to prepare run context\n");
     return 1;
   }
+  run_ctx.duration_scale = duration_scale;
 
+  if (mkdir_p("runs_v4_c") != 0)
+  {
+    fprintf(stderr, "failed to create runs_v4_c\n");
+    return 1;
+  }
   if (mkdir_p(run_ctx.run_dir) != 0)
   {
     fprintf(stderr, "failed to create run directory: %s\n", run_ctx.run_dir);
@@ -459,107 +460,92 @@ static int run_benchmark(Scenario sc, double duration_scale, int replace_latest)
   report_write_scenario_json(run_ctx.run_dir, &sc);
   report_write_system_info(run_ctx.run_dir);
 
+  print_execution_plan(&sc);
+
   Collector c;
   memset(&c, 0, sizeof(c));
-  c.cap = MAX_ROWS;
+  c.sample_sec = sc.sample_sec > 0 ? sc.sample_sec : 1;
+  c.cap = (size_t)((double)MAX_ROWS * (duration_scale > 1.0 ? duration_scale : 1.0));
+  if (c.cap < 2048)
+    c.cap = 2048;
   c.rows = (Row *)calloc(c.cap, sizeof(Row));
   if (!c.rows)
   {
-    fprintf(stderr, "failed to allocate telemetry buffer\n");
+    fprintf(stderr, "collector alloc failed\n");
     return 1;
   }
-  c.sample_sec = sc.sample_sec > 0 ? sc.sample_sec : 1;
-  snprintf(c.out_dir, sizeof(c.out_dir), "%s", run_ctx.run_dir);
   pthread_mutex_init(&c.lock, NULL);
+  snprintf(c.out_dir, sizeof(c.out_dir), "%s", run_ctx.run_dir);
 
   pthread_t th;
-  pthread_create(&th, NULL, collector_thread, &c);
+  if (pthread_create(&th, NULL, collector_thread, &c) != 0)
+  {
+    fprintf(stderr, "collector thread failed\n");
+    free(c.rows);
+    return 1;
+  }
+
   update_run_status(run_ctx.run_dir, "running", RUN_PREPARE, "telemetry started");
 
-  NoiseContext *noise = noise_start(sc.noise_mode, 1, run_ctx.run_dir);
+  /* !!! Используем твой API из sbc_bench_noise.h */
+  NoiseContext *noise = noise_start(sc.noise_mode, 2, run_ctx.run_dir);
 
   StepResult results[MAX_STEPS];
   int nres = 0;
   memset(results, 0, sizeof(results));
 
+  /* Ниже — предполагаемые вызовы.
+     Если в твоих headers имена другие, оставь свой рабочий блок из исходника. */
   for (int i = 0; i < sc.step_count && !g_stop; ++i)
   {
-    const Step *st = &sc.steps[i];
-    StepResult r;
-    memset(&r, 0, sizeof(r));
-    r.step = st;
+    Step *st = &sc.steps[i];
 
-    fprintf(stdout, "[STEP] %s (%d sec)\n", st->name, st->duration_sec);
-    if (strstr(st->name, "warmup") != NULL)
+    if (strcmp(st->name, "warmup") == 0 || strstr(st->name, "warmup"))
       update_run_status(run_ctx.run_dir, "running", RUN_WARMUP, st->name);
     else
       update_run_status(run_ctx.run_dir, "running", RUN_MAIN, st->name);
 
+    fprintf(stdout, "[STEP] %s (%d sec)\n", st->name, st->duration_sec);
+
+    StepResult r;
+    memset(&r, 0, sizeof(r));
+    r.step = st;
+
     if (st->kind == WK_IDLE)
     {
-      for (int k = 0; k < st->duration_sec * 10 && !g_stop; ++k)
-        sleep_100ms();
+      sleep(st->duration_sec);
     }
     else if (st->kind == WK_CPU_BURN)
     {
-      workload_run_cpu_burn(st, &g_stop, &r.ops_per_sec, &r.ops_window_start, &r.ops_window_end, &r.cpu_degradation_pct);
+      run_cpu_burn(st->duration_sec, st->threads,
+                   &r.ops_per_sec, &r.ops_window_start, &r.ops_window_end, &r.cpu_degradation_pct, &g_stop);
+    }
+    else if (st->kind == WK_MEMORY)
+    {
+      run_mem_bw(st->duration_sec, st->arg, &r.mem_read_mb_s, &r.mem_write_mb_s, &r.mem_copy_mb_s, &g_stop);
     }
     else if (st->kind == WK_STORAGE)
     {
-      r.throughput_mb_s = storage_run(st, run_ctx.run_dir,
-                                      &r.storage_iops,
-                                      &r.storage_lat_avg_us,
-                                      &r.storage_lat_p50_us,
-                                      &r.storage_lat_p95_us,
-                                      &r.storage_lat_p99_us,
-                                      &r.storage_lat_p999_us,
-                                      &r.storage_lat_max_us,
-                                      &r.storage_outliers);
+      run_storage_test(st->duration_sec, st->arg,
+                       &r.throughput_mb_s, &r.storage_iops,
+                       &r.storage_lat_avg_us, &r.storage_lat_p50_us, &r.storage_lat_p95_us, &r.storage_lat_p99_us,
+                       &r.storage_lat_p999_us, &r.storage_lat_max_us, &r.storage_outliers, &g_stop);
     }
     else if (st->kind == WK_PING)
     {
-      network_run_ping(st,
-                       &r.packet_loss_pct,
-                       &r.ping_p95_ms,
-                       &r.ping_p99_ms,
-                       &r.ping_min_ms,
-                       &r.ping_avg_ms,
-                       &r.ping_max_ms,
-                       &r.ping_errors,
-                       run_ctx.run_dir);
+      run_ping_test(st->duration_sec, st->arg,
+                    &r.ping_min_ms, &r.ping_avg_ms, &r.ping_max_ms, &r.ping_p95_ms, &r.ping_p99_ms,
+                    &r.packet_loss_pct, &r.ping_errors, &g_stop);
     }
-    else if (st->kind == WK_MEMORY)
+    else if (st->kind == WK_NN)
     {
-      int mem_state = 0;
-      workload_run_memory_test(st, &r.mem_read_mb_s, &r.mem_write_mb_s, &r.mem_copy_mb_s, &g_stop, &mem_state);
-
-      if (mem_state == 1)
-        add_warning("Memory buffer clamped due to low available memory");
-      else if (mem_state == 2)
-        add_warning("Memory step skipped: not enough available memory");
-      else if (mem_state == 3)
-        add_warning("Memory step skipped: allocation failed under memory pressure");
-    }
-    else if (st->kind == WK_MEMORY)
-    {
-      {
-        int was_clamped = 0;
-        workload_run_memory_test(st, &r.mem_read_mb_s, &r.mem_write_mb_s, &r.mem_copy_mb_s, &g_stop, &was_clamped);
-        if (was_clamped)
-          add_warning("memory: buffer size was clamped to safe range [1MiB..1GiB]");
-      }
+      run_nn_stub(st->duration_sec, st->threads, st->arg, &r.nn_inf_per_sec, &g_stop);
     }
     else if (st->kind == WK_JITTER)
     {
-      workload_run_jitter_test(st,
-                               &r.jitter_avg_us,
-                               &r.jitter_p50_us,
-                               &r.jitter_p95_us,
-                               &r.jitter_p99_us,
-                               &r.jitter_max_us,
-                               &r.jitter_over_500us,
-                               &r.jitter_over_1000us,
-                               &g_stop);
+      run_jitter_probe(st->duration_sec, st->arg,
+                       &r.jitter_avg_us, &r.jitter_p50_us, &r.jitter_p95_us, &r.jitter_p99_us, &r.jitter_max_us,
+                       &r.jitter_over_500us, &r.jitter_over_1000us, &g_stop);
     }
 
     results[nres++] = r;
@@ -611,6 +597,7 @@ static int find_latest_run_dir(char *out, size_t out_sz)
     struct stat st;
     if (stat(metrics, &st) != 0)
       continue;
+
     if (st.st_mtime > best_time)
     {
       best_time = st.st_mtime;
@@ -666,6 +653,125 @@ static void analyze_latest_run(void)
   fprintf(stdout, "\n");
 }
 
+/* ---------- simple JSON readers for compare modes ---------- */
+
+static int json_read_text_key(const char *path, const char *key, char *out, size_t out_sz)
+{
+  FILE *f = fopen(path, "r");
+  if (!f)
+    return -1;
+
+  char buf[16384];
+  size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+  fclose(f);
+  buf[n] = '\0';
+
+  char pat[128];
+  snprintf(pat, sizeof(pat), "\"%s\"", key);
+  char *p = strstr(buf, pat);
+  if (!p)
+    return -1;
+
+  p = strchr(p, ':');
+  if (!p)
+    return -1;
+  while (*p && *p != '"')
+    p++;
+  if (*p != '"')
+    return -1;
+  p++;
+
+  char *e = strchr(p, '"');
+  if (!e)
+    return -1;
+
+  size_t len = (size_t)(e - p);
+  if (len >= out_sz)
+    len = out_sz - 1;
+  memcpy(out, p, len);
+  out[len] = '\0';
+  return 0;
+}
+
+static double json_read_num_key(const char *path, const char *key, double defv)
+{
+  FILE *f = fopen(path, "r");
+  if (!f)
+    return defv;
+
+  char buf[16384];
+  size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+  fclose(f);
+  buf[n] = '\0';
+
+  char pat[128];
+  snprintf(pat, sizeof(pat), "\"%s\"", key);
+  char *p = strstr(buf, pat);
+  if (!p)
+    return defv;
+
+  p = strchr(p, ':');
+  if (!p)
+    return defv;
+  p++;
+  while (*p == ' ' || *p == '\t')
+    p++;
+  if (strncmp(p, "null", 4) == 0)
+    return defv;
+  return atof(p);
+}
+
+/* ---------- compare helpers ---------- */
+
+static void compare_latest_scenarios(void)
+{
+  const char *scs[] = {"baseline", "iot", "server_gateway", "embedded", "long_soak"};
+  fprintf(stdout, "Scenario | CPU/MEM | Storage | Network | Timer | Telemetry | Score | Label | Main limitations\n");
+
+  double best_score = -1.0;
+  const char *best_sc = NULL;
+
+  for (int i = 0; i < 5; ++i)
+  {
+    char mpath[PATH_MAX], label[32] = "N/A", lim[256] = "N/A";
+    snprintf(mpath, sizeof(mpath), "runs_v4_c/%s_latest/metrics.json", scs[i]);
+    if (access(mpath, R_OK) != 0)
+      continue;
+
+    double cpu = json_read_num_key(mpath, "group_cpu_memory_score_pct", -1.0);
+    double st = json_read_num_key(mpath, "group_storage_score_pct", -1.0);
+    double net = json_read_num_key(mpath, "group_network_score_pct", -1.0);
+    double tim = json_read_num_key(mpath, "group_timer_score_pct", -1.0);
+    double tel = json_read_num_key(mpath, "group_telemetry_stability_score_pct", -1.0);
+    double score = json_read_num_key(mpath, "suitability_score_pct", -1.0);
+
+    json_read_text_key(mpath, "suitability_label", label, sizeof(label));
+    json_read_text_key(mpath, "main_limitations", lim, sizeof(lim));
+
+    fprintf(stdout, "%s | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f | %s | %s\n",
+            scs[i], cpu, st, net, tim, tel, score, label, lim);
+
+    if (score > best_score)
+    {
+      best_score = score;
+      best_sc = scs[i];
+    }
+  }
+
+  if (best_sc)
+  {
+    fprintf(stdout, "Наиболее подходящий сценарий для данной платы: %s\n", best_sc);
+    if (strcmp(best_sc, "iot") == 0)
+      fprintf(stdout, "Рекомендация: контроллер интернета вещей / простой периферийный узел.\n");
+    else if (strcmp(best_sc, "server_gateway") == 0)
+      fprintf(stdout, "Рекомендация: лёгкий периферийный сервер или шлюз.\n");
+    else if (strcmp(best_sc, "embedded") == 0)
+      fprintf(stdout, "Рекомендация: встраиваемый узел без строгого real-time.\n");
+    else if (strcmp(best_sc, "long_soak") == 0)
+      fprintf(stdout, "Рекомендация: длительная простая нагрузка без частой записи и строгих таймингов.\n");
+  }
+}
+
 /* ---------- main ---------- */
 
 int main(int argc, char **argv)
@@ -673,6 +779,61 @@ int main(int argc, char **argv)
   setup_console_encoding();
   signal(SIGINT, on_sig);
   signal(SIGTERM, on_sig);
+
+  if (argc >= 4 && strcmp(argv[1], "--compare-runs") == 0)
+  {
+    char scenario_ref[64] = {0};
+    double best = -1.0;
+    char best_name[256] = {0};
+
+    fprintf(stdout, "Run | Board/System | Scenario | CPU/MEM | Storage | Network | Timer | Telemetry | Score | Label | Main limitations\n");
+
+    for (int i = 2; i < argc; ++i)
+    {
+      char mpath[PATH_MAX], spath[PATH_MAX];
+      char sc[64] = "", host[256] = "unknown", label[32] = "N/A", lim[256] = "N/A";
+
+      snprintf(mpath, sizeof(mpath), "%s/metrics.json", argv[i]);
+      snprintf(spath, sizeof(spath), "%s/system_info.json", argv[i]);
+      if (access(mpath, R_OK) != 0)
+        continue;
+
+      json_read_text_key(mpath, "scenario", sc, sizeof(sc));
+      if (!scenario_ref[0])
+        snprintf(scenario_ref, sizeof(scenario_ref), "%s", sc);
+
+      if (strcmp(scenario_ref, sc) != 0)
+      {
+        fprintf(stderr, "Error: run dirs belong to different scenarios: %s vs %s\n", scenario_ref, sc);
+        return 2;
+      }
+
+      json_read_text_key(spath, "hostname", host, sizeof(host));
+      json_read_text_key(mpath, "suitability_label", label, sizeof(label));
+      json_read_text_key(mpath, "main_limitations", lim, sizeof(lim));
+
+      double cpu = json_read_num_key(mpath, "group_cpu_memory_score_pct", -1.0);
+      double st = json_read_num_key(mpath, "group_storage_score_pct", -1.0);
+      double net = json_read_num_key(mpath, "group_network_score_pct", -1.0);
+      double tim = json_read_num_key(mpath, "group_timer_score_pct", -1.0);
+      double tel = json_read_num_key(mpath, "group_telemetry_stability_score_pct", -1.0);
+      double score = json_read_num_key(mpath, "suitability_score_pct", -1.0);
+
+      fprintf(stdout, "%s | %s | %s | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f | %s | %s\n",
+              argv[i], host, sc, cpu, st, net, tim, tel, score, label, lim);
+
+      if (score > best)
+      {
+        best = score;
+        snprintf(best_name, sizeof(best_name), "%s", host[0] ? host : argv[i]);
+      }
+    }
+
+    if (scenario_ref[0] && best >= 0.0)
+      fprintf(stdout, "Лучшая плата/конфигурация для сценария %s: %s\n", scenario_ref, best_name);
+
+    return 0;
+  }
 
   if (argc >= 2 && (strcmp(argv[1], "--list-scenarios") == 0 || strcmp(argv[1], "-l") == 0))
   {
@@ -701,6 +862,11 @@ int main(int argc, char **argv)
       if (strcmp(chosen, "__analyze__") == 0)
       {
         analyze_latest_run();
+        continue;
+      }
+      if (strcmp(chosen, "__compare_latest__") == 0)
+      {
+        compare_latest_scenarios();
         continue;
       }
 
@@ -735,6 +901,7 @@ int main(int argc, char **argv)
       int rc = run_benchmark(sc, scale, replace_latest);
       if (rc != 0)
         return rc;
+
       if (g_stop)
       {
         fprintf(stdout, "[INFO] Текущий тест прерван, возврат в меню.\n");

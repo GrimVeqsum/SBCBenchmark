@@ -77,6 +77,76 @@ static void json_num_or_null(FILE *f, const char *key, double v, int comma)
     fprintf(f, "  \"%s\": %.3f%s\n", key, v, comma ? "," : "");
 }
 
+static double clamp01(double v)
+{
+  if (v < 0.0)
+    return 0.0;
+  if (v > 1.0)
+    return 1.0;
+  return v;
+}
+
+static double clamp100(double v)
+{
+  if (v < 0.0)
+    return 0.0;
+  if (v > 100.0)
+    return 100.0;
+  return v;
+}
+
+static const char *suitability_label(double s)
+{
+  if (s >= 75.0)
+    return "GOOD";
+  if (s >= 45.0)
+    return "LIMITED";
+  return "BAD";
+}
+
+static void scenario_weights(const char *scenario, double *w_cpu_mem, double *w_storage, double *w_network, double *w_timer, double *w_telemetry)
+{
+  *w_cpu_mem = 0.30;
+  *w_storage = 0.20;
+  *w_network = 0.15;
+  *w_timer = 0.15;
+  *w_telemetry = 0.20;
+  if (!scenario)
+    return;
+  if (strcmp(scenario, "server_gateway") == 0)
+  {
+    *w_cpu_mem = 0.15;
+    *w_storage = 0.35;
+    *w_network = 0.25;
+    *w_timer = 0.05;
+    *w_telemetry = 0.20;
+  }
+  else if (strcmp(scenario, "iot") == 0)
+  {
+    *w_cpu_mem = 0.15;
+    *w_storage = 0.10;
+    *w_network = 0.25;
+    *w_timer = 0.20;
+    *w_telemetry = 0.30;
+  }
+  else if (strcmp(scenario, "embedded") == 0)
+  {
+    *w_cpu_mem = 0.20;
+    *w_storage = 0.10;
+    *w_network = 0.10;
+    *w_timer = 0.35;
+    *w_telemetry = 0.25;
+  }
+  else if (strcmp(scenario, "long_soak") == 0)
+  {
+    *w_cpu_mem = 0.20;
+    *w_storage = 0.20;
+    *w_network = 0.10;
+    *w_timer = 0.20;
+    *w_telemetry = 0.30;
+  }
+}
+
 void report_write_run_status(const char *run_dir, const char *status, const char *stage, const char *message, const RunMessages *msgs)
 {
   char p[PATH_MAX];
@@ -242,7 +312,6 @@ void report_write_system_info(const char *run_dir)
   fprintf(f, "}\n");
   fclose(f);
 }
-
 void report_write_metrics_json(const char *run_dir, const Scenario *sc, const Collector *c, const StepResult *res, int nres)
 {
   char p[PATH_MAX];
@@ -269,6 +338,8 @@ void report_write_metrics_json(const char *run_dir, const Scenario *sc, const Co
     throttle_hint = detect_freq_drop_with_temp_rise(freq.v, temp.v, freq.n < temp.n ? freq.n : temp.n, 10.0, 5.0);
 
   double cpu_avg = -1.0, nn_avg = -1.0, mem_copy_avg = -1.0, storage_avg = -1.0, ping_p95_avg = -1.0, jitter_p99_avg = -1.0;
+  double mem_used_avg = -1.0, temp_c_max = -1.0, cpu_freq_mhz_avg = -1.0, cpu_freq_mhz_min = -1.0;
+  double psi_cpu_some_avg10 = -1.0, psi_io_some_avg10 = -1.0, psi_mem_some_avg10 = -1.0, power_w_avg = -1.0, perf_per_watt = -1.0;
   int c_cpu = 0, c_nn = 0, c_mem = 0, c_st = 0, c_net = 0, c_jit = 0;
   double cpu_windows[MAX_STEPS];
   size_t cpu_windows_n = 0;
@@ -382,6 +453,160 @@ void report_write_metrics_json(const char *run_dir, const Scenario *sc, const Co
   StatsSummary jitter_max_stats = stats_from_array(jitter_max_vals, jitter_max_n);
   double cpu_stability = calc_stability_coeff(cpu_windows, cpu_windows_n);
 
+  double mem_sum = 0.0, freq_sum = 0.0, psi_cpu_sum = 0.0, psi_io_sum = 0.0, psi_mem_sum = 0.0, power_sum = 0.0;
+  size_t mem_n = 0, freq_n = 0, psi_cpu_n = 0, psi_io_n = 0, psi_mem_n = 0, power_n = 0;
+  for (size_t i = 0; i < c->nrows; ++i)
+  {
+    const Row *r = &c->rows[i];
+    if (r->mem_used_pct >= 0.0)
+    {
+      mem_sum += r->mem_used_pct;
+      mem_n++;
+    }
+    if (r->temp_c >= 0.0 && r->temp_c > temp_c_max)
+      temp_c_max = r->temp_c;
+    if (r->cpu_freq_mhz > 0.0)
+    {
+      freq_sum += r->cpu_freq_mhz;
+      freq_n++;
+      if (cpu_freq_mhz_min < 0.0 || r->cpu_freq_mhz < cpu_freq_mhz_min)
+        cpu_freq_mhz_min = r->cpu_freq_mhz;
+    }
+    if (r->psi_cpu_some_avg10 >= 0.0)
+    {
+      psi_cpu_sum += r->psi_cpu_some_avg10;
+      psi_cpu_n++;
+    }
+    if (r->psi_io_some_avg10 >= 0.0)
+    {
+      psi_io_sum += r->psi_io_some_avg10;
+      psi_io_n++;
+    }
+    if (r->psi_mem_some_avg10 >= 0.0)
+    {
+      psi_mem_sum += r->psi_mem_some_avg10;
+      psi_mem_n++;
+    }
+    if (r->power_w > 0.0)
+    {
+      power_sum += r->power_w;
+      power_n++;
+    }
+  }
+  if (mem_n)
+    mem_used_avg = mem_sum / (double)mem_n;
+  if (freq_n)
+    cpu_freq_mhz_avg = freq_sum / (double)freq_n;
+  if (psi_cpu_n)
+    psi_cpu_some_avg10 = psi_cpu_sum / (double)psi_cpu_n;
+  if (psi_io_n)
+    psi_io_some_avg10 = psi_io_sum / (double)psi_io_n;
+  if (psi_mem_n)
+    psi_mem_some_avg10 = psi_mem_sum / (double)psi_mem_n;
+  if (power_n)
+    power_w_avg = power_sum / (double)power_n;
+  if (cpu_avg > 0.0 && power_w_avg > 0.0)
+    perf_per_watt = cpu_avg / power_w_avg;
+
+  double group_cpu_memory_score = -1.0, group_storage_score = -1.0, group_network_score = -1.0, group_timer_score = -1.0, group_telemetry_score = -1.0;
+  if (cpu_avg > 0.0 || mem_copy_avg > 0.0 || cpu_stability >= 0.0)
+  {
+    group_cpu_memory_score = 85.0;
+    if (cpu_stability >= 0.0)
+    {
+      if (cpu_stability < 0.85)
+        group_cpu_memory_score = 35.0;
+      else if (cpu_stability < 0.95)
+        group_cpu_memory_score = 60.0;
+      else
+        group_cpu_memory_score = 90.0;
+    }
+  }
+  if (storage_p99_stats.median > 0.0)
+  {
+    if (storage_p99_stats.median <= 100000.0)
+      group_storage_score = 85.0;
+    else if (storage_p99_stats.median <= 500000.0)
+      group_storage_score = 60.0;
+    else
+      group_storage_score = 30.0;
+    if (storage_max_stats.max > 1000000.0)
+      group_storage_score -= 15.0;
+    group_storage_score = clamp100(group_storage_score);
+  }
+  if (ping_p95_avg > 0.0 || network_loss_stats.avg >= 0.0 || network_errors_sum > 0)
+  {
+    group_network_score = 90.0;
+    if (ping_p95_avg > 100.0)
+      group_network_score -= 40.0;
+    else if (ping_p95_avg > 50.0)
+      group_network_score -= 20.0;
+    if (network_loss_stats.avg > 1.0)
+      group_network_score -= 35.0;
+    else if (network_loss_stats.avg > 0.0)
+      group_network_score -= 15.0;
+    if (network_errors_sum > 0)
+      group_network_score -= 10.0;
+    group_network_score = clamp100(group_network_score);
+  }
+  if (jitter_p99_avg > 0.0)
+  {
+    if (jitter_p99_avg <= 1000.0)
+      group_timer_score = 90.0;
+    else if (jitter_p99_avg <= 10000.0)
+      group_timer_score = 60.0;
+    else
+      group_timer_score = 30.0;
+    if (jitter_p99_avg > 1000000.0)
+      group_timer_score = 10.0;
+    if (jitter_over1000_sum > 0)
+      group_timer_score -= 10.0;
+    group_timer_score = clamp100(group_timer_score);
+  }
+  if (temp_c_max > 0.0 || cpu_freq_mhz_avg > 0.0 || throttle_hint >= 0)
+  {
+    group_telemetry_score = 90.0;
+    if (temp_c_max > 75.0)
+      group_telemetry_score -= 40.0;
+    else if (temp_c_max > 60.0)
+      group_telemetry_score -= 20.0;
+    if (throttle_hint == 1)
+      group_telemetry_score -= 10.0;
+    group_telemetry_score = clamp100(group_telemetry_score);
+  }
+
+  double w_cpu, w_st, w_net, w_tim, w_tel;
+  scenario_weights(sc->name, &w_cpu, &w_st, &w_net, &w_tim, &w_tel);
+  double w_sum = 0.0, s_sum = 0.0;
+  if (group_cpu_memory_score >= 0.0)
+  {
+    w_sum += w_cpu;
+    s_sum += w_cpu * group_cpu_memory_score;
+  }
+  if (group_storage_score >= 0.0)
+  {
+    w_sum += w_st;
+    s_sum += w_st * group_storage_score;
+  }
+  if (group_network_score >= 0.0)
+  {
+    w_sum += w_net;
+    s_sum += w_net * group_network_score;
+  }
+  if (group_timer_score >= 0.0)
+  {
+    w_sum += w_tim;
+    s_sum += w_tim * group_timer_score;
+  }
+  if (group_telemetry_score >= 0.0)
+  {
+    w_sum += w_tel;
+    s_sum += w_tel * group_telemetry_score;
+  }
+  double suitability_score = (w_sum > 0.0) ? (s_sum / w_sum) : -1.0;
+  double group_coverage_score = (sc->step_count > 0) ? clamp100(100.0 * ((double)nres / (double)sc->step_count)) : -1.0;
+  const char *label = suitability_label(suitability_score < 0.0 ? 0.0 : suitability_score);
+
   fprintf(f, "{\n");
   fprintf(f, "  \"scenario\": \"%s\",\n", sc->name ? sc->name : "unknown");
   fprintf(f, "  \"power_source\": \"assumed\",\n");
@@ -414,6 +639,29 @@ void report_write_metrics_json(const char *run_dir, const Scenario *sc, const Co
   fprintf(f, "  \"jitter_over_500us_total\": %" PRIu64 ",\n", jitter_over500_sum);
   fprintf(f, "  \"jitter_over_1000us_total\": %" PRIu64 ",\n", jitter_over1000_sum);
   json_num_or_null(f, "cpu_stability_score", cpu_stability, 1);
+  json_num_or_null(f, "mem_used_pct_avg", mem_used_avg, 1);
+  json_num_or_null(f, "temp_c_max", temp_c_max, 1);
+  json_num_or_null(f, "cpu_freq_mhz_avg", cpu_freq_mhz_avg, 1);
+  json_num_or_null(f, "cpu_freq_mhz_min", cpu_freq_mhz_min, 1);
+  json_num_or_null(f, "psi_cpu_some_avg10", psi_cpu_some_avg10, 1);
+  json_num_or_null(f, "psi_io_some_avg10", psi_io_some_avg10, 1);
+  json_num_or_null(f, "psi_mem_some_avg10", psi_mem_some_avg10, 1);
+  json_num_or_null(f, "power_w_avg", power_w_avg, 1);
+  json_num_or_null(f, "perf_per_watt", perf_per_watt, 1);
+  json_num_or_null(f, "group_cpu_memory_score_pct", group_cpu_memory_score, 1);
+  json_num_or_null(f, "group_storage_score_pct", group_storage_score, 1);
+  json_num_or_null(f, "group_network_score_pct", group_network_score, 1);
+  json_num_or_null(f, "group_timer_score_pct", group_timer_score, 1);
+  json_num_or_null(f, "group_telemetry_stability_score_pct", group_telemetry_score, 1);
+  json_num_or_null(f, "group_coverage_score_pct", group_coverage_score, 1);
+  json_num_or_null(f, "suitability_score_pct", suitability_score, 1);
+  fprintf(f, "  \"suitability_label\": \"%s\",\n", label);
+  fprintf(f, "  \"main_strengths\": \"stable network/cpu behavior\",\n");
+  fprintf(f, "  \"main_limitations\": \"%s\",\n", (group_storage_score >= 0.0 && group_storage_score < 45.0) ? "storage latency tail" : ((group_timer_score >= 0.0 && group_timer_score < 45.0) ? "timer jitter" : "none critical"));
+  fprintf(f, "  \"recommended_role\": \"%s\",\n",
+          strcmp(sc->name, "iot") == 0 ? "контроллер интернета вещей / простой периферийный узел" : (strcmp(sc->name, "server_gateway") == 0 ? "лёгкий периферийный сервер или шлюз" : (strcmp(sc->name, "embedded") == 0 ? "встраиваемый узел без строгого real-time" : (strcmp(sc->name, "long_soak") == 0 ? "длительная простая нагрузка" : "первичная диагностика"))));
+  fprintf(f, "  \"scenario_summary\": \"%s\",\n",
+          strcmp(sc->name, "iot") == 0 ? "Плата подходит для роли контроллера интернета вещей или простого периферийного узла, если требуется периодическая передача данных и короткие вычислительные нагрузки." : (strcmp(sc->name, "server_gateway") == 0 ? "Плата может использоваться как лёгкий сетевой шлюз, но ограничена для серверной роли с частой синхронной записью на накопитель." : (strcmp(sc->name, "embedded") == 0 ? "Плата ограниченно пригодна для встраиваемых задач без строгих требований к стабильным временным интервалам." : (strcmp(sc->name, "long_soak") == 0 ? "Плата подходит для длительных простых задач, но накопитель и таймер являются основными ограничителями." : "Базовый сценарий используется для первичной диагностики и не должен сам по себе считаться окончательным выбором роли."))));
   fprintf(f, "  \"throttle_hint\": %d,\n", throttle_hint);
   fprintf(f, "  \"unavailable_metrics\": [");
   int first = 1;
@@ -439,12 +687,11 @@ void report_write_metrics_json(const char *run_dir, const Scenario *sc, const Co
   s_free(&freq);
   s_free(&temp);
 }
-
 static double local_cpu_stability_score(const StepResult *res, int nres)
 {
   for (int i = 0; i < nres; ++i)
     if (res[i].step->kind == WK_CPU_BURN && res[i].ops_window_start > 0.0)
-      return res[i].ops_window_end / res[i].ops_window_start;
+      return clamp01(res[i].ops_window_end / res[i].ops_window_start);
   return -1.0;
 }
 
@@ -697,6 +944,28 @@ void report_write_report_md(const char *run_dir, const Scenario *sc, const Colle
 
   fprintf(f, "- Итог: плата подходит для общих вычислительных и сетевых задач при текущей нагрузке. Ограничения определяются хвостовыми задержками накопителя и/или джиттером таймера, если они превышают пороги сценария.\n");
 
+  double scenario_score = 85.0;
+  if (strcmp(result, "FAIL") == 0)
+    scenario_score = 30.0;
+  else if (strcmp(result, "WARN") == 0)
+    scenario_score = 60.0;
+  fprintf(f, "\n## Scenario suitability\n\n");
+  fprintf(f, "- Итоговая пригодность: **%s**\n", suitability_label(scenario_score));
+  fprintf(f, "- Score: %.1f%%\n", scenario_score);
+  fprintf(f, "- Групповые оценки: см. `metrics.json` поля `group_*_score_pct`.\n");
+  fprintf(f, "- Сильные стороны: стабильная сеть/CPU при отсутствии потерь и деградации.\n");
+  fprintf(f, "- Ограничения: накопитель и/или таймер при высоких хвостовых задержках.\n");
+  if (strcmp(sc->name, "iot") == 0)
+    fprintf(f, "- Плата подходит для роли контроллера интернета вещей или простого периферийного узла, если требуется периодическая передача данных и короткие вычислительные нагрузки.\n");
+  else if (strcmp(sc->name, "server_gateway") == 0)
+    fprintf(f, "- Плата может использоваться как лёгкий сетевой шлюз, но ограничена для серверной роли с частой синхронной записью на накопитель.\n");
+  else if (strcmp(sc->name, "embedded") == 0)
+    fprintf(f, "- Плата ограниченно пригодна для встраиваемых задач без строгих требований к стабильным временным интервалам.\n");
+  else if (strcmp(sc->name, "long_soak") == 0)
+    fprintf(f, "- Плата подходит для длительных простых задач, но накопитель и таймер являются основными ограничителями.\n");
+  else
+    fprintf(f, "- Базовый сценарий используется для первичной диагностики и не должен сам по себе считаться окончательным выбором роли.\n");
+
   fprintf(f, "\n## Verdict\n\n");
   fprintf(f, "- Result: **%s**\n", result);
   if (strcmp(result, "FAIL") == 0)
@@ -770,6 +1039,15 @@ void report_write_step_csvs(const char *run_dir, const StepResult *res, int nres
     for (int i = 0; i < nres; ++i)
       if (res[i].step->kind == WK_JITTER)
         fprintf(f, "%s,%.3f,%.3f,%.3f,%.3f,%.3f,%" PRIu64 ",%" PRIu64 "\n", res[i].step->name, res[i].jitter_avg_us, res[i].jitter_p50_us, res[i].jitter_p95_us, res[i].jitter_p99_us, res[i].jitter_max_us, res[i].jitter_over_500us, res[i].jitter_over_1000us);
+    fclose(f);
+  }
+
+  if (join_path_local(p, sizeof(p), run_dir, "nn.csv") == 0 && (f = fopen(p, "w")))
+  {
+    fprintf(f, "step,inf_per_sec\n");
+    for (int i = 0; i < nres; ++i)
+      if (res[i].step->kind == WK_NN)
+        fprintf(f, "%s,%.3f\n", res[i].step->name, res[i].nn_inf_per_sec);
     fclose(f);
   }
 }
